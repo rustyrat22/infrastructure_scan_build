@@ -19,9 +19,104 @@ import json
 import os
 import re
 import time
+import getpass
 import ipaddress
+import tempfile
 from datetime import datetime, timezone
 from collections import defaultdict
+
+
+# --- Security helpers -------------------------------------------------------
+
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
+WINDOWS_RESERVED_NAMES.update(f"COM{i}" for i in range(1, 10))
+WINDOWS_RESERVED_NAMES.update(f"LPT{i}" for i in range(1, 10))
+
+
+def sanitize_filename_component(value, fallback="unknown", max_length=64):
+    """Return a safe single path component derived from *value*.
+
+    Strips path separators, traversal sequences, control characters and
+    Windows-reserved device names so a remote-controlled hostname can never
+    escape the output directory.
+    """
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = text.strip("._-")
+    if not text or text in (".", ".."):
+        return fallback
+    if text.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        text = f"_{text}"
+    return text[:max_length] or fallback
+
+
+def safe_output_path(output_dir, filename):
+    """Join *filename* to *output_dir* and refuse any path escape."""
+    base = os.path.realpath(output_dir)
+    candidate = os.path.realpath(os.path.join(base, filename))
+    try:
+        contained = os.path.commonpath([base, candidate]) == base
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(f"Refusing to write outside output directory: {filename!r}")
+    return candidate
+
+
+def write_password_file(password):
+    """Write *password* to a private temp file for `plink -pwfile`."""
+    fd, path = tempfile.mkstemp(prefix="flashnet_pw_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(password)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def remove_password_file(path):
+    """Overwrite then delete a temporary password file."""
+    if not path:
+        return
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as handle:
+            handle.write(b"\x00" * size)
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def read_password_file(path):
+    """Read the first line of a password file without the trailing newline."""
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.readline().rstrip("\r\n")
+
+
+def parse_network(network_range):
+    """Return an ip_network for *network_range*, or None if it is invalid."""
+    try:
+        return ipaddress.ip_network(network_range, strict=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def ip_in_network(ip, network):
+    """Return True when *ip* is a valid address inside *network*."""
+    if network is None:
+        return False
+    try:
+        return ipaddress.ip_address(ip) in network
+    except (TypeError, ValueError):
+        return False
 
 
 def print_usage():
@@ -59,7 +154,18 @@ OPTIONS:
 
     -k, --key FILE         Path to SSH private key (.ppk)
 
-    -pw, --password PWD    SSH password (fallback if key not provided)
+    -pw, --ask-password    Prompt for the SSH password (never echoed). The
+                           password is written to a private temp file and
+                           passed to plink via -pwfile; it never appears in
+                           the process list.
+    --password-file FILE   Read the SSH password from the first line of FILE.
+    --password-stdin       Read the SSH password from standard input.
+
+    --hostkey FINGERPRINT  Pin the server host key (e.g. a SHA256:... value
+                           printed by plink). Required unless
+                           --insecure-host-key is given.
+    --insecure-host-key    Disable host key pinning and accept any key.
+                           UNSAFE: enables man-in-the-middle attacks.
 
     -o, --output DIR       Output directory for JSON files (default: ./output/)
 
@@ -87,8 +193,11 @@ EXAMPLES:
     Quick ping-only discovery, scan up to 10 devices:
         python device_scanner.py -m ping -n 10
 
-    Scan with password authentication:
-        python device_scanner.py -r 10.0.0.0/24 -u admin -pw SecretPass
+    Scan with password authentication (prompts, never echoes):
+        python device_scanner.py -r 10.0.0.0/24 -u admin -pw --hostkey SHA256:abc123
+
+    Read the password from a protected file:
+        python device_scanner.py -r 10.0.0.0/24 -u admin --password-file .secret --hostkey SHA256:abc123
 
     Verbose scan with custom output:
         python device_scanner.py -r 192.168.1.0/24 -v -o ./reports/
@@ -202,8 +311,13 @@ def discover_devices_ping(network_range, max_devices=None, timeout=2, verbose=Fa
 
 
 def discover_devices_arp(network_range, verbose=False):
-    """Discover devices via ARP table and arping."""
+    """Discover devices via the neighbour/ARP cache, scoped to *network_range*."""
     devices = []
+    network = parse_network(network_range)
+    if network is None:
+        print(f"[ERROR] Invalid network range: {network_range}")
+        return devices
+
     try:
         if sys.platform == "win32":
             result = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
@@ -211,14 +325,19 @@ def discover_devices_arp(network_range, verbose=False):
                 match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-f\-]{17})", line)
                 if match:
                     ip = match.group(1)
+                    if not ip_in_network(ip, network):
+                        continue
                     mac = match.group(2).replace("-", ":")
                     devices.append({"ip": ip, "mac": mac, "hostname": ip, "method": "arp"})
         else:
             result = subprocess.run(["ip", "neigh"], capture_output=True, text=True, timeout=10)
             for line in result.stdout.split("\n"):
                 parts = line.split()
-                if len(parts) >= 3 and parts[2] != "FAILED" and parts[2] != "INCOMPLETE":
-                    devices.append({"ip": parts[0], "mac": parts[2], "hostname": parts[0], "method": "arp"})
+                if len(parts) >= 3 and parts[2] not in ("FAILED", "INCOMPLETE"):
+                    ip = parts[0]
+                    if not ip_in_network(ip, network):
+                        continue
+                    devices.append({"ip": ip, "mac": parts[2], "hostname": ip, "method": "arp"})
     except Exception as e:
         if verbose:
             print(f"[WARN] ARP discovery failed: {e}")
@@ -226,17 +345,25 @@ def discover_devices_arp(network_range, verbose=False):
     return devices
 
 
-def discover_devices_tshark(interface_idx=None, duration=10, verbose=False):
-    """Discover devices via tshark packet capture."""
+def discover_devices_tshark(interface_idx=None, duration=10, network_range=None, verbose=False):
+    """Discover devices via tshark packet capture, scoped to *network_range*."""
     devices = []
+    network = parse_network(network_range) if network_range else None
+    if network_range and network is None:
+        print(f"[ERROR] Invalid network range: {network_range}")
+        return devices
+
     try:
         cmd = ["tshark", "-a", f"duration:{duration}", "-T", "fields",
                "-e", "ip.src", "-e", "ip.dst", "-e", "eth.src", "-e", "eth.dst",
                "-e", "dhcp.options.hostname", "-e", "mdns.host_name",
                "-E", "separator=|"]
+        if network is not None:
+            # Capture filter keeps unrelated LAN traffic out of the scan and
+            # out of any credential-bearing SSH attempts.
+            cmd[1:1] = ["-f", f"net {network}"]
         if interface_idx is not None:
-            cmd.insert(1, "-i")
-            cmd.insert(2, str(interface_idx))
+            cmd[1:1] = ["-i", str(interface_idx)]
 
         if verbose:
             print(f"\n[TSHARK] Capturing {duration}s for device discovery...")
@@ -255,7 +382,9 @@ def discover_devices_tshark(interface_idx=None, duration=10, verbose=False):
                 if not hostname:
                     hostname = parts[5].strip() if len(parts) > 5 else ""
 
-                if ip and not ip.startswith(("127.", "224.", "239.", "255.")) and ip not in seen_ips:
+                if (ip and not ip.startswith(("127.", "224.", "239.", "255."))
+                        and ip not in seen_ips
+                        and (network is None or ip_in_network(ip, network))):
                     seen_ips[ip] = True
                     devices.append({
                         "ip": ip,
@@ -284,7 +413,7 @@ def discover_devices(network_range, mode="all", interface_idx=None, max_devices=
                 all_devices[dev["ip"]] = dev
 
     if mode in ("tshark", "all") and interface_idx is not None:
-        for dev in discover_devices_tshark(interface_idx, verbose=verbose):
+        for dev in discover_devices_tshark(interface_idx, network_range=network_range, verbose=verbose):
             if dev["ip"] not in all_devices:
                 all_devices[dev["ip"]] = dev
 
@@ -600,14 +729,14 @@ def build_device_json(device_info, enum_result, ip, mac, timestamp):
 
 
 def save_device_json(report, output_dir, ip, hostname):
-    """Save device report to a JSON file."""
+    """Save device report to a JSON file inside *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
-    safe_hostname = (hostname or ip).replace(" ", "_").replace("/", "_")
-    safe_ip = ip.replace(".", "_")
+    safe_hostname = sanitize_filename_component(hostname or ip)
+    safe_ip = sanitize_filename_component(str(ip).replace(".", "_"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     filename = f"{safe_hostname}_{safe_ip}_{timestamp}.json"
-    filepath = os.path.join(output_dir, filename)
+    filepath = safe_output_path(output_dir, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
@@ -722,7 +851,11 @@ def main():
     port = 22
     user = "root"
     key_file = None
-    password = None
+    password_file = None
+    ask_password = False
+    password_stdin = False
+    hostkey = None
+    insecure_hostkey = False
     output_dir = "./output/"
     timeout = 30
     verbose = False
@@ -752,9 +885,32 @@ def main():
         elif args[i] in ("-k", "--key") and i + 1 < len(args):
             key_file = args[i + 1]
             i += 2
-        elif args[i] in ("-pw", "--password") and i + 1 < len(args):
-            password = args[i + 1]
+        elif args[i] in ("-pw", "--password", "--ask-password"):
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                sys.exit(
+                    "[ERROR] Passing a password directly on the command line is insecure.\n"
+                    "        Use --ask-password (or -pw with no value) to be prompted,\n"
+                    "        --password-file FILE, or --password-stdin."
+                )
+            ask_password = True
+            i += 1
+        elif args[i].startswith(("--password=", "-pw=")):
+            sys.exit(
+                "[ERROR] Passing a password directly on the command line is insecure.\n"
+                "        Use --ask-password, --password-file FILE, or --password-stdin."
+            )
+        elif args[i] == "--password-file" and i + 1 < len(args):
+            password_file = args[i + 1]
             i += 2
+        elif args[i] == "--password-stdin":
+            password_stdin = True
+            i += 1
+        elif args[i] == "--hostkey" and i + 1 < len(args):
+            hostkey = args[i + 1]
+            i += 2
+        elif args[i] == "--insecure-host-key":
+            insecure_hostkey = True
+            i += 1
         elif args[i] in ("-o", "--output") and i + 1 < len(args):
             output_dir = args[i + 1]
             i += 2
@@ -782,17 +938,55 @@ def main():
         else:
             i += 1
 
+    selected_password_sources = sum(bool(v) for v in (password_file, password_stdin, ask_password))
+    if selected_password_sources > 1:
+        sys.exit("[ERROR] Choose only one of --ask-password, --password-file, --password-stdin.")
+
+    if not hostkey and not insecure_hostkey:
+        sys.exit(
+            "[ERROR] Host key verification is required to protect credentials from\n"
+            "        man-in-the-middle attacks. Pass --hostkey <fingerprint> or,\n"
+            "        only if you accept that risk, --insecure-host-key."
+        )
+
     auth_args = []
     if key_file:
-        auth_args.extend(["-i", key_file])
-    if password:
-        auth_args.extend(["-pw", password])
+        key_path = os.path.expanduser(key_file)
+        if not os.path.isfile(key_path):
+            sys.exit(f"[ERROR] SSH key not found: {key_path}")
+        auth_args.extend(["-i", key_path])
+    if hostkey:
+        auth_args.extend(["-hostkey", hostkey])
+    elif insecure_hostkey:
+        print("[WARN] --insecure-host-key set: server identity is NOT verified; MITM is possible.")
 
-    scan_and_populate(
-        network_range=network_range, mode=mode, interface_idx=interface_idx,
-        max_devices=max_devices, port=port, user=user, auth_args=auth_args,
-        timeout=timeout, output_dir=output_dir, verbose=verbose, quiet=quiet
-    )
+    password = None
+    try:
+        if password_file:
+            password = read_password_file(os.path.expanduser(password_file))
+        elif password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        elif ask_password:
+            password = getpass.getpass("SSH password: ")
+    except OSError as e:
+        sys.exit(f"[ERROR] Could not read password: {e}")
+
+    if password is not None and password == "":
+        sys.exit("[ERROR] Password is empty.")
+
+    password_path = None
+    if password:
+        password_path = write_password_file(password)
+        auth_args.extend(["-pwfile", password_path])
+
+    try:
+        scan_and_populate(
+            network_range=network_range, mode=mode, interface_idx=interface_idx,
+            max_devices=max_devices, port=port, user=user, auth_args=auth_args,
+            timeout=timeout, output_dir=output_dir, verbose=verbose, quiet=quiet
+        )
+    finally:
+        remove_password_file(password_path)
 
 
 if __name__ == "__main__":

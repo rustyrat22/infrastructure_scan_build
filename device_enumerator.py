@@ -13,7 +13,79 @@ import sys
 import json
 import os
 import re
+import getpass
+import tempfile
 from datetime import datetime, timezone
+
+
+# --- Security helpers -------------------------------------------------------
+
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
+WINDOWS_RESERVED_NAMES.update(f"COM{i}" for i in range(1, 10))
+WINDOWS_RESERVED_NAMES.update(f"LPT{i}" for i in range(1, 10))
+
+
+def sanitize_filename_component(value, fallback="unknown", max_length=64):
+    """Return a safe single path component derived from *value*."""
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = text.strip("._-")
+    if not text or text in (".", ".."):
+        return fallback
+    if text.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        text = f"_{text}"
+    return text[:max_length] or fallback
+
+
+def safe_output_path(output_dir, filename):
+    """Join *filename* to *output_dir* and refuse any path escape."""
+    base = os.path.realpath(output_dir)
+    candidate = os.path.realpath(os.path.join(base, filename))
+    try:
+        contained = os.path.commonpath([base, candidate]) == base
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(f"Refusing to write outside output directory: {filename!r}")
+    return candidate
+
+
+def write_password_file(password):
+    """Write *password* to a private temp file for `plink -pwfile`."""
+    fd, path = tempfile.mkstemp(prefix="flashnet_pw_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(password)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def remove_password_file(path):
+    """Overwrite then delete a temporary password file."""
+    if not path:
+        return
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as handle:
+            handle.write(b"\x00" * size)
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def read_password_file(path):
+    """Read the first line of a password file without the trailing newline."""
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.readline().rstrip("\r\n")
 
 
 def check_plink():
@@ -53,22 +125,28 @@ OPTIONS:
     -p, --port PORT        SSH port (default: 22)
     -u, --user USER        SSH username (default: current user)
     -k, --key FILE         Path to SSH private key file (.ppk)
-    -pw, --password PWD    SSH password (not recommended; use -k instead)
+    -pw, --ask-password    Prompt for the SSH password (never echoed). The
+                           password is passed to plink via -pwfile.
+    --password-file FILE   Read the SSH password from the first line of FILE.
+    --password-stdin       Read the SSH password from standard input.
+    --hostkey FINGERPRINT  Pin the server host key (e.g. SHA256:...). Required
+                           unless --insecure-host-key is given.
+    --insecure-host-key    Accept any server key. UNSAFE: enables MITM.
     -o, --output DIR       Output directory for JSON reports (default: ./output/)
     -c, --command CMD      Run a custom command instead of the default suite
     -m, --os-type TYPE     Override OS detection: windows, linux, macos
     --timeout SEC          SSH connection timeout in seconds (default: 30)
-    --batch                Run in non-interactive mode (accept host key)
+    --batch                Run in non-interactive mode (disables prompts)
     -v, --verbose          Enable verbose output
     -q, --quiet            Suppress console output. Only write JSON report.
     -h, --help             Show this help message and exit.
 
 EXAMPLES:
     Scan a Linux device with SSH key:
-        python device_enumerator.py -t 192.168.1.50 -u admin -k ~/.ssh/key.ppk
+        python device_enumerator.py -t 192.168.1.50 -u admin -k ~/.ssh/key.ppk --hostkey SHA256:abc123
 
-    Scan a Windows device with password:
-        python device_enumerator.py -t 192.168.1.100 -u admin -pw SecretPass
+    Scan a Windows device with an interactive password prompt:
+        python device_enumerator.py -t 192.168.1.100 -u admin -pw --hostkey SHA256:abc123
 
     Run a custom command:
         python device_enumerator.py -t 192.168.1.50 -u root -k key.ppk -c "uname -a"
@@ -407,14 +485,16 @@ def enumerate_device(target, port=22, user="root", auth_args=None, os_type=None,
 
 
 def save_report(report, output_dir="./output"):
-    """Save enumeration report to JSON file."""
+    """Save enumeration report to a JSON file inside *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    hostname = report["device_info"].get("hostname", "unknown").replace(" ", "_")
-    target = report["scan_metadata"]["target"].replace(".", "_")
+    hostname = sanitize_filename_component(report["device_info"].get("hostname"), fallback="unknown")
+    target = sanitize_filename_component(
+        report["scan_metadata"]["target"].replace(".", "_"), fallback="target"
+    )
 
     filename = f"device_enum_{hostname}_{target}_{timestamp}.json"
-    filepath = os.path.join(output_dir, filename)
+    filepath = safe_output_path(output_dir, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
@@ -466,7 +546,11 @@ def main():
     port = 22
     user = "root"
     key_file = None
-    password = None
+    password_file = None
+    ask_password = False
+    password_stdin = False
+    hostkey = None
+    insecure_hostkey = False
     output_dir = "./output"
     custom_cmd = None
     os_type = None
@@ -490,9 +574,32 @@ def main():
         elif args[i] in ("-k", "--key") and i + 1 < len(args):
             key_file = args[i + 1]
             i += 2
-        elif args[i] in ("-pw", "--password") and i + 1 < len(args):
-            password = args[i + 1]
+        elif args[i] in ("-pw", "--password", "--ask-password"):
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                sys.exit(
+                    "[ERROR] Passing a password directly on the command line is insecure.\n"
+                    "        Use --ask-password (or -pw with no value) to be prompted,\n"
+                    "        --password-file FILE, or --password-stdin."
+                )
+            ask_password = True
+            i += 1
+        elif args[i].startswith(("--password=", "-pw=")):
+            sys.exit(
+                "[ERROR] Passing a password directly on the command line is insecure.\n"
+                "        Use --ask-password, --password-file FILE, or --password-stdin."
+            )
+        elif args[i] == "--password-file" and i + 1 < len(args):
+            password_file = args[i + 1]
             i += 2
+        elif args[i] == "--password-stdin":
+            password_stdin = True
+            i += 1
+        elif args[i] == "--hostkey" and i + 1 < len(args):
+            hostkey = args[i + 1]
+            i += 2
+        elif args[i] == "--insecure-host-key":
+            insecure_hostkey = True
+            i += 1
         elif args[i] in ("-o", "--output") and i + 1 < len(args):
             output_dir = args[i + 1]
             i += 2
@@ -532,37 +639,75 @@ def main():
     if not check_plink():
         sys.exit(1)
 
+    selected_password_sources = sum(bool(v) for v in (password_file, password_stdin, ask_password))
+    if selected_password_sources > 1:
+        sys.exit("[ERROR] Choose only one of --ask-password, --password-file, --password-stdin.")
+
+    if not hostkey and not insecure_hostkey:
+        sys.exit(
+            "[ERROR] Host key verification is required to protect credentials from\n"
+            "        man-in-the-middle attacks. Pass --hostkey <fingerprint> or,\n"
+            "        only if you accept that risk, --insecure-host-key."
+        )
+
     auth_args = []
     if key_file:
-        auth_args.extend(["-i", key_file])
+        key_path = os.path.expanduser(key_file)
+        if not os.path.isfile(key_path):
+            sys.exit(f"[ERROR] SSH key not found: {key_path}")
+        auth_args.extend(["-i", key_path])
+    if hostkey:
+        auth_args.extend(["-hostkey", hostkey])
+    elif insecure_hostkey:
+        print("[WARN] --insecure-host-key set: server identity is NOT verified; MITM is possible.")
+
+    password = None
+    try:
+        if password_file:
+            password = read_password_file(os.path.expanduser(password_file))
+        elif password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        elif ask_password:
+            password = getpass.getpass("SSH password: ")
+    except OSError as e:
+        sys.exit(f"[ERROR] Could not read password: {e}")
+
+    if password is not None and password == "":
+        sys.exit("[ERROR] Password is empty.")
+
+    password_path = None
     if password:
-        auth_args.extend(["-pw", password])
+        password_path = write_password_file(password)
+        auth_args.extend(["-pwfile", password_path])
 
-    if custom_cmd:
+    try:
+        if custom_cmd:
+            if not quiet:
+                print(f"\n[ENUM] Running custom command on {target}...")
+            stdout, stderr, rc = run_plink(target, port, user, custom_cmd, auth_args, timeout, batch, verbose)
+            print(stdout)
+            if stderr:
+                print(f"[STDERR] {stderr}", file=sys.stderr)
+            sys.exit(rc)
+
+        report = enumerate_device(
+            target=target, port=port, user=user, auth_args=auth_args,
+            os_type=os_type, timeout=timeout, batch=batch,
+            verbose=verbose, quiet=quiet
+        )
+
+        if report is None:
+            print("[ERROR] Enumeration failed.")
+            sys.exit(1)
+
+        filepath = save_report(report, output_dir)
+
         if not quiet:
-            print(f"\n[ENUM] Running custom command on {target}...")
-        stdout, stderr, rc = run_plink(target, port, user, custom_cmd, auth_args, timeout, batch, verbose)
-        print(stdout)
-        if stderr:
-            print(f"[STDERR] {stderr}", file=sys.stderr)
-        sys.exit(rc)
-
-    report = enumerate_device(
-        target=target, port=port, user=user, auth_args=auth_args,
-        os_type=os_type, timeout=timeout, batch=batch,
-        verbose=verbose, quiet=quiet
-    )
-
-    if report is None:
-        print("[ERROR] Enumeration failed.")
-        sys.exit(1)
-
-    filepath = save_report(report, output_dir)
-
-    if not quiet:
-        print_summary(report, filepath)
-    else:
-        print(f"Report saved to: {filepath}")
+            print_summary(report, filepath)
+        else:
+            print(f"Report saved to: {filepath}")
+    finally:
+        remove_password_file(password_path)
 
 
 if __name__ == "__main__":

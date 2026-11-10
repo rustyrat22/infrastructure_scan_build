@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Flash_Network — Device Scanner & JSON Reporter (PowerShell)
@@ -31,8 +31,19 @@
 .PARAMETER Key
     Path to SSH private key (.ppk)
 
-.PARAMETER Password
-    SSH password (fallback if key not provided)
+.PARAMETER PasswordFile
+    Read the SSH password from the first line of this file.
+
+.PARAMETER AskPassword
+    Prompt for the SSH password. The password is passed to plink via a
+    private temp file (-pwfile) and never appears in the process list.
+
+.PARAMETER HostKey
+    Pin the server host key fingerprint (e.g. SHA256:...). Required unless
+    -InsecureHostKey is specified.
+
+.PARAMETER InsecureHostKey
+    Accept any server host key. UNSAFE: enables man-in-the-middle attacks.
 
 .PARAMETER OutputDir
     Output directory for JSON files (default: ./output/)
@@ -53,7 +64,7 @@
     .\device_scanner.ps1
     .\device_scanner.ps1 -Range "192.168.1.0/24" -Key "C:\keys\key.ppk" -User admin
     .\device_scanner.ps1 -Mode ping -MaxDevices 10
-    .\device_scanner.ps1 -Range "10.0.0.0/24" -User admin -Password "SecretPass"
+    .\device_scanner.ps1 -Range "10.0.0.0/24" -User admin -AskPassword -HostKey "SHA256:abc123"
 #>
 
 param(
@@ -64,7 +75,10 @@ param(
     [Alias("p")][int]$Port = 22,
     [Alias("u")][string]$User = "root",
     [Alias("k")][string]$Key = "",
-    [Alias("pw")][string]$Password = "",
+    [string]$PasswordFile = "",
+    [switch]$AskPassword = $false,
+    [string]$HostKey = "",
+    [switch]$InsecureHostKey = $false,
     [Alias("o")][string]$OutputDir = "./output/",
     [Alias("t")][int]$Timeout = 30,
     [switch]$Verbose = $false,
@@ -111,7 +125,10 @@ PARAMETERS:
     -Port PORT         SSH port (default: 22)
     -User USER         Default SSH username (default: root)
     -Key FILE          Path to SSH private key (.ppk)
-    -Password PWD      SSH password
+    -PasswordFile FILE Read SSH password from the first line of FILE
+    -AskPassword       Prompt for the SSH password (never echoed)
+    -HostKey FP        Pin the server host key (required for verification)
+    -InsecureHostKey   Accept any server key (UNSAFE: MITM risk)
     -OutputDir DIR     Output directory (default: ./output/)
     -Timeout SEC       Per-device SSH timeout (default: 30)
     -Verbose           Enable verbose output
@@ -143,6 +160,89 @@ JSON OUTPUT (per device):
 "@
     Write-Host $usage
     exit 0
+}
+
+function ConvertTo-SafeFileName {
+    param([string]$Value, [string]$Fallback = "unknown")
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Fallback }
+    $safe = [regex]::Replace($Value, '[^A-Za-z0-9._-]+', '_').Trim([char[]]@('.', '_', '-'))
+    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -eq '.' -or $safe -eq '..') { return $Fallback }
+    if ($safe.Length -gt 64) { $safe = $safe.Substring(0, 64) }
+    $reserved = @('CON','PRN','AUX','NUL')
+    $reserved += 1..9 | ForEach-Object { "COM$_" }
+    $reserved += 1..9 | ForEach-Object { "LPT$_" }
+    if ($reserved -contains $safe.Split('.')[0].ToUpperInvariant()) { $safe = "_$safe" }
+    return $safe
+}
+
+function Join-SafeOutputPath {
+    param([string]$OutputDir, [string]$FileName)
+    $base = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd([char[]]@('\', '/'))
+    $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($base, $FileName))
+    $prefix = $base + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to write outside output directory: $full"
+    }
+    return $full
+}
+
+function Test-IPInRange {
+    param([string]$IP, [string]$NetworkRange)
+    try {
+        $parts = $NetworkRange.Split('/')
+        if ($parts.Count -ne 2) { return $false }
+        $network = [System.Net.IPAddress]::Parse($parts[0])
+        $prefix = [int]$parts[1]
+        if ($prefix -lt 0 -or $prefix -gt 32) { return $false }
+        $address = [System.Net.IPAddress]::Parse($IP)
+        if ($address.AddressFamily -ne $network.AddressFamily) { return $false }
+        $netBytes = $network.GetAddressBytes()
+        $ipBytes = $address.GetAddressBytes()
+        $fullBytes = [int][Math]::Floor($prefix / 8)
+        for ($i = 0; $i -lt $fullBytes; $i++) {
+            if ($netBytes[$i] -ne $ipBytes[$i]) { return $false }
+        }
+        $remaining = $prefix % 8
+        if ($remaining -gt 0) {
+            $mask = [byte](0xFF -shl (8 - $remaining))
+            if (($netBytes[$fullBytes] -band $mask) -ne ($ipBytes[$fullBytes] -band $mask)) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function New-PasswordFile {
+    param([string]$Password)
+    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+        "flashnet_pw_" + [guid]::NewGuid().ToString("N") + ".txt")
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $Password, $utf8)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $path -AclObject $acl
+        } else {
+            & chmod 600 $path 2>$null
+        }
+    } catch { }
+    return $path
+}
+
+function Remove-PasswordFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        $size = (Get-Item -LiteralPath $Path).Length
+        if ($size -gt 0) {
+            [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $size))
+        }
+    } catch { }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 
 function Test-Tool {
@@ -210,16 +310,19 @@ function Discover-Ping {
 }
 
 function Discover-Arp {
-    param([bool]$Verbose)
+    param([string]$NetworkRange, [bool]$Verbose)
     $devices = @()
     try {
         $result = arp -a
         foreach ($line in $result) {
             if ($line -match "(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-f\-]{17})") {
+                $ip = $Matches[1]
+                # The ARP cache contains unrelated hosts; never SSH into them.
+                if ($NetworkRange -and -not (Test-IPInRange -IP $ip -NetworkRange $NetworkRange)) { continue }
                 $devices += @{
-                    ip = $Matches[1]
+                    ip = $ip
                     mac = $Matches[2].Replace("-", ":")
-                    hostname = $Matches[1]
+                    hostname = $ip
                     method = "arp"
                 }
             }
@@ -229,7 +332,7 @@ function Discover-Arp {
 }
 
 function Discover-Tshark {
-    param([int]$InterfaceIdx, [bool]$Verbose)
+    param([int]$InterfaceIdx, [string]$NetworkRange, [bool]$Verbose)
     $devices = @()
     $seenIps = @{}
 
@@ -237,6 +340,7 @@ function Discover-Tshark {
         $cmdArgs = @("-a", "duration:10", "-T", "fields",
                      "-e", "ip.src", "-e", "ip.dst", "-e", "eth.src",
                      "-E", "separator=|")
+        if ($NetworkRange) { $cmdArgs = @("-f", "net $NetworkRange") + $cmdArgs }
         if ($InterfaceIdx -ge 0) { $cmdArgs = @("-i", $InterfaceIdx.ToString()) + $cmdArgs }
 
         $tmpFile = [System.IO.Path]::GetTempFileName()
@@ -251,7 +355,8 @@ function Discover-Tshark {
             foreach ($ipField in @(0, 1)) {
                 $ip = $parts[$ipField].Trim()
                 $mac = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
-                if ($ip -and $ip -notmatch "^(127\.|224\.|239\.|255\.)" -and -not $seenIps.ContainsKey($ip)) {
+                if ($ip -and $ip -notmatch "^(127\.|224\.|239\.|255\.)" -and -not $seenIps.ContainsKey($ip) `
+                        -and ((-not $NetworkRange) -or (Test-IPInRange -IP $ip -NetworkRange $NetworkRange))) {
                     $seenIps[$ip] = $true
                     $devices += @{
                         ip = $ip
@@ -282,7 +387,7 @@ function Discover-Devices {
     }
 
     if ($Mode -in @("arp", "all")) {
-        foreach ($dev in (Discover-Arp -Verbose $Verbose)) {
+        foreach ($dev in (Discover-Arp -NetworkRange $NetworkRange -Verbose $Verbose)) {
             if (-not $allDevices.ContainsKey($dev.ip)) {
                 $allDevices[$dev.ip] = $dev
             }
@@ -290,7 +395,7 @@ function Discover-Devices {
     }
 
     if ($Mode -in @("tshark", "all") -and $Interface -ge 0) {
-        foreach ($dev in (Discover-Tshark -InterfaceIdx $Interface -Verbose $Verbose)) {
+        foreach ($dev in (Discover-Tshark -InterfaceIdx $Interface -NetworkRange $NetworkRange -Verbose $Verbose)) {
             if (-not $allDevices.ContainsKey($dev.ip)) {
                 $allDevices[$dev.ip] = $dev
             }
@@ -556,10 +661,13 @@ function Enumerate-Device {
     }
 
     $duration = ((Get-Date) - $startTime).TotalSeconds
+    $osText = if ($null -ne $stdoutMap["os_info"]) { [string]$stdoutMap["os_info"] } else { "" }
+    $osText = $osText.Trim()
+    if ($osText.Length -gt 200) { $osText = $osText.Substring(0, 200) }
 
     return @{
-        hostname = $stdoutMap["hostname"].Trim()
-        os = ($stdoutMap["os_info"] ?: "").Trim().Substring(0, [Math]::Min(200, ($stdoutMap["os_info"] ?: "").Length))
+        hostname = ([string]$stdoutMap["hostname"]).Trim()
+        os = $osText
         architecture = $stdoutMap["architecture"].Trim()
         applications = $unique
         scan_methods = $scanMethods
@@ -598,11 +706,12 @@ function Save-DeviceJson {
 
     if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 
-    $safeHostname = ($Hostname ?: $Ip) -replace "[\s/]", "_"
-    $safeIp = $Ip -replace "\.", "_"
+    $hostValue = if ([string]::IsNullOrWhiteSpace($Hostname)) { $Ip } else { $Hostname }
+    $safeHostname = ConvertTo-SafeFileName -Value $hostValue -Fallback "unknown"
+    $safeIp = ConvertTo-SafeFileName -Value ($Ip -replace "\.", "_") -Fallback "ip"
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $filename = "${safeHostname}_${safeIp}_${timestamp}.json"
-    $filepath = Join-Path $OutputDir $filename
+    $filepath = Join-SafeOutputPath -OutputDir $OutputDir -FileName $filename
 
     $Report | ConvertTo-Json -Depth 5 | Out-File -FilePath $filepath -Encoding UTF8
     return $filepath
@@ -684,7 +793,10 @@ function Scan-AndPopulate {
 
     $totalTime = ((Get-Date) - $startTime).TotalSeconds
     $successful = ($results | Where-Object { $_.status -eq "success" }).Count
-    $totalApps = ($results | Where-Object { $_.status -eq "success" } | Measure-Object -Property apps -Sum).Sum
+    $totalApps = 0
+    foreach ($result in $results) {
+        if ($result.status -eq "success") { $totalApps += [int]$result.apps }
+    }
 
     # Write index
     if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
@@ -722,12 +834,55 @@ if (-not $Quiet) {
     Write-Header "Flash_Network — Device Scanner & JSON Reporter"
 }
 
-$authArgs = @()
-if ($Key) { $authArgs += "-i", $Key }
-if ($Password) { $authArgs += "-pw", $Password }
+if ($PasswordFile -and $AskPassword) {
+    Write-Host "[ERROR] Use only one of -PasswordFile or -AskPassword." -ForegroundColor Red
+    exit 1
+}
 
-Scan-AndPopulate `
-    -NetworkRange $Range -Mode $Mode -Interface $Interface `
-    -MaxDevices $MaxDevices -Port $Port -User $User `
-    -AuthArgs $authArgs -Timeout $Timeout `
-    -OutputDir $OutputDir -Verbose:$Verbose -Quiet:$Quiet
+if (-not $HostKey -and -not $InsecureHostKey) {
+    Write-Host "[ERROR] Host key verification is required to protect credentials from" -ForegroundColor Red
+    Write-Host "        man-in-the-middle attacks. Pass -HostKey <fingerprint> or, only" -ForegroundColor Red
+    Write-Host "        if you accept that risk, -InsecureHostKey." -ForegroundColor Red
+    exit 1
+}
+
+$authArgs = @()
+if ($Key) {
+    if (-not (Test-Path -LiteralPath $Key)) {
+        Write-Host "[ERROR] SSH key not found: $Key" -ForegroundColor Red
+        exit 1
+    }
+    $authArgs += "-i", (Resolve-Path -LiteralPath $Key).Path
+}
+if ($HostKey) {
+    $authArgs += "-hostkey", $HostKey
+} elseif ($InsecureHostKey) {
+    Write-Host "[WARN] -InsecureHostKey set: server identity is NOT verified; MITM is possible." -ForegroundColor Yellow
+}
+
+$pwTemp = $null
+$plainPassword = $null
+try {
+    if ($PasswordFile) {
+        if (-not (Test-Path -LiteralPath $PasswordFile)) { throw "Password file not found: $PasswordFile" }
+        $plainPassword = Get-Content -LiteralPath $PasswordFile -TotalCount 1
+    } elseif ($AskPassword) {
+        $secure = Read-Host -AsSecureString "SSH password"
+        $plainPassword = [System.Net.NetworkCredential]::new("", $secure).Password
+    }
+
+    if ($null -ne $plainPassword) {
+        if ($plainPassword -eq "") { throw "Password is empty." }
+        $pwTemp = New-PasswordFile -Password $plainPassword
+        $authArgs += "-pwfile", $pwTemp
+    }
+
+    Scan-AndPopulate `
+        -NetworkRange $Range -Mode $Mode -Interface $Interface `
+        -MaxDevices $MaxDevices -Port $Port -User $User `
+        -AuthArgs $authArgs -Timeout $Timeout `
+        -OutputDir $OutputDir -Verbose:$Verbose -Quiet:$Quiet
+} finally {
+    Remove-PasswordFile -Path $pwTemp
+    $plainPassword = $null
+}

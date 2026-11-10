@@ -59,7 +59,11 @@ python device_scanner.py [options]
 | `-p, --port PORT` | SSH port (default: 22) |
 | `-u, --user USER` | SSH username (default: root) |
 | `-k, --key FILE` | SSH private key (.ppk) |
-| `-pw, --password PWD` | SSH password |
+| `-pw, --ask-password` | Prompt for the SSH password (never echoed) |
+| `--password-file FILE` | Read the password from the first line of FILE |
+| `--password-stdin` | Read the password from stdin |
+| `--hostkey FINGERPRINT` | Pin the server host key (required unless `--insecure-host-key`) |
+| `--insecure-host-key` | Accept any host key (UNSAFE: MITM risk) |
 | `-o, --output DIR` | Output directory (default: `./output/`) |
 | `-t, --timeout SEC` | SSH timeout (default: 30) |
 | `-v, --verbose` | Verbose output |
@@ -79,8 +83,8 @@ python device_scanner.py -r 192.168.1.0/24 -k ~/.ssh/key.ppk -u admin
 # Quick ping-only, max 10 devices
 python device_scanner.py -m ping -n 10
 
-# Password auth, verbose, custom output
-python device_scanner.py -r 10.0.0.0/24 -u admin -pw SecretPass -v -o ./reports/
+# Password auth (prompted), verbose, custom output
+python device_scanner.py -r 10.0.0.0/24 -u admin -pw --hostkey SHA256:abc123 -v -o ./reports/
 ```
 
 ---
@@ -100,7 +104,10 @@ python device_scanner.py -r 10.0.0.0/24 -u admin -pw SecretPass -v -o ./reports/
 | `-Port PORT` | SSH port (default: 22) |
 | `-User USER` | SSH username (default: root) |
 | `-Key FILE` | SSH private key (.ppk) |
-| `-Password PWD` | SSH password |
+| `-PasswordFile FILE` | Read the password from the first line of FILE |
+| `-AskPassword` | Prompt for the SSH password (never echoed) |
+| `-HostKey FINGERPRINT` | Pin the server host key (required unless `-InsecureHostKey`) |
+| `-InsecureHostKey` | Accept any host key (UNSAFE: MITM risk) |
 | `-OutputDir DIR` | Output directory (default: `./output/`) |
 | `-Timeout SEC` | SSH timeout (default: 30) |
 | `-Verbose` | Verbose output |
@@ -113,8 +120,11 @@ python device_scanner.py -r 10.0.0.0/24 -u admin -pw SecretPass -v -o ./reports/
 # Auto-detect and scan
 .\device_scanner.ps1
 
-# Specific range with SSH key
-.\device_scanner.ps1 -Range "192.168.1.0/24" -Key "C:\keys\key.ppk" -User admin
+# Specific range with SSH key and pinned host key
+.\device_scanner.ps1 -Range "192.168.1.0/24" -Key "C:\keys\key.ppk" -User admin -HostKey "SHA256:abc123"
+
+# Prompt for a password (never echoed)
+.\device_scanner.ps1 -Range "192.168.1.0/24" -User admin -AskPassword -HostKey "SHA256:abc123"
 
 # Ping-only, max 10 devices
 .\device_scanner.ps1 -Mode ping -MaxDevices 10

@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Flash_Network — PuTTY/Plink Device Enumerator (PowerShell)
@@ -22,8 +22,19 @@
 .PARAMETER Key
     Path to SSH private key file (.ppk)
 
-.PARAMETER Password
-    SSH password (not recommended; prefer key-based auth)
+.PARAMETER PasswordFile
+    Read the SSH password from the first line of this file.
+
+.PARAMETER AskPassword
+    Prompt for the SSH password. The password is passed to plink via a
+    private temp file (-pwfile) and never appears in the process list.
+
+.PARAMETER HostKey
+    Pin the server host key fingerprint (e.g. SHA256:...). Required unless
+    -InsecureHostKey is specified.
+
+.PARAMETER InsecureHostKey
+    Accept any server host key. UNSAFE: enables man-in-the-middle attacks.
 
 .PARAMETER OutputDir
     Output directory for JSON reports (default: ./output/)
@@ -50,8 +61,8 @@
     Show usage information
 
 .EXAMPLE
-    .\device_enumerator.ps1 -Target 192.168.1.50 -User admin -Key "C:\keys\key.ppk"
-    .\device_enumerator.ps1 -Target 192.168.1.100 -User admin -Password "SecretPass"
+    .\device_enumerator.ps1 -Target 192.168.1.50 -User admin -Key "C:\keys\key.ppk" -HostKey "SHA256:abc123"
+    .\device_enumerator.ps1 -Target 192.168.1.100 -User admin -AskPassword -HostKey "SHA256:abc123"
     .\device_enumerator.ps1 -Target 192.168.1.50 -User root -Key "key.ppk" -Command "uname -a"
     .\device_enumerator.ps1 -Help
 #>
@@ -61,7 +72,10 @@ param(
     [Alias("p")][int]$Port = 22,
     [Alias("u")][string]$User = "root",
     [Alias("k")][string]$Key = "",
-    [Alias("pw")][string]$Password = "",
+    [string]$PasswordFile = "",
+    [switch]$AskPassword = $false,
+    [string]$HostKey = "",
+    [switch]$InsecureHostKey = $false,
     [Alias("o")][string]$OutputDir = "./output/",
     [Alias("c")][string]$Command = "",
     [Alias("m")][string]$OsType = "",
@@ -110,7 +124,10 @@ PARAMETERS:
     -Port PORT         SSH port (default: 22)
     -User USER         SSH username (default: root)
     -Key FILE          Path to SSH private key file (.ppk)
-    -Password PWD      SSH password (not recommended; use -Key instead)
+    -PasswordFile FILE Read SSH password from the first line of FILE
+    -AskPassword       Prompt for the SSH password (never echoed)
+    -HostKey FP        Pin the server host key (required for verification)
+    -InsecureHostKey   Accept any server key (UNSAFE: MITM risk)
     -OutputDir DIR     Output directory for JSON reports (default: ./output/)
     -Command CMD       Run a custom command instead of the default suite
     -OsType TYPE       Override OS detection: windows, linux, macos
@@ -125,7 +142,7 @@ EXAMPLES:
         .\device_enumerator.ps1 -Target 192.168.1.50 -User admin -Key "C:\keys\key.ppk"
 
     Scan a Windows device with password:
-        .\device_enumerator.ps1 -Target 192.168.1.100 -User admin -Password "SecretPass"
+        .\device_enumerator.ps1 -Target 192.168.1.100 -User admin -AskPassword -HostKey "SHA256:abc123"
 
     Run a custom command:
         .\device_enumerator.ps1 -Target 192.168.1.50 -User root -Key "key.ppk" -Command "uname -a"
@@ -135,6 +152,64 @@ EXAMPLES:
 "@
     Write-Host $usage
     exit 0
+}
+
+function ConvertTo-SafeFileName {
+    param([string]$Value, [string]$Fallback = "unknown")
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Fallback }
+    $safe = [regex]::Replace($Value, '[^A-Za-z0-9._-]+', '_').Trim([char[]]@('.', '_', '-'))
+    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -eq '.' -or $safe -eq '..') { return $Fallback }
+    if ($safe.Length -gt 64) { $safe = $safe.Substring(0, 64) }
+    $reserved = @('CON','PRN','AUX','NUL')
+    $reserved += 1..9 | ForEach-Object { "COM$_" }
+    $reserved += 1..9 | ForEach-Object { "LPT$_" }
+    if ($reserved -contains $safe.Split('.')[0].ToUpperInvariant()) { $safe = "_$safe" }
+    return $safe
+}
+
+function Join-SafeOutputPath {
+    param([string]$OutputDir, [string]$FileName)
+    $base = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd([char[]]@('\', '/'))
+    $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($base, $FileName))
+    $prefix = $base + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to write outside output directory: $full"
+    }
+    return $full
+}
+
+function New-PasswordFile {
+    param([string]$Password)
+    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+        "flashnet_pw_" + [guid]::NewGuid().ToString("N") + ".txt")
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $Password, $utf8)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $path -AclObject $acl
+        } else {
+            & chmod 600 $path 2>$null
+        }
+    } catch { }
+    return $path
+}
+
+function Remove-PasswordFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        $size = (Get-Item -LiteralPath $Path).Length
+        if ($size -gt 0) {
+            [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $size))
+        }
+    } catch { }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 
 function Test-Plink {
@@ -363,9 +438,9 @@ function Parse-Applications {
             if ($line -match "Location:\s*(.+)") {
                 if ($null -ne $current -and $current.name) {
                     $current.install_location = $Matches[1].Trim()
-                    $current.signer = $current.signer ?: ""
-                    $current.url = $current.url ?: ""
-                    $current.last_update = $current.last_update ?: ""
+                    if ($null -eq $current.signer) { $current.signer = "" }
+                    if ($null -eq $current.url) { $current.url = "" }
+                    if ($null -eq $current.last_update) { $current.last_update = "" }
                     $apps += [PSCustomObject]$current
                     $current = $null
                 }
@@ -453,23 +528,33 @@ function Enumerate-Device {
 
     $duration = ((Get-Date) - $startTime).TotalSeconds
 
+    $osValue = ([string]$stdoutMap["os_release"]).Trim()
+    if (-not $osValue) { $osValue = ([string]$stdoutMap["os_info"]).Trim() }
+    if ($osValue.Length -gt 200) { $osValue = $osValue.Substring(0, 200) }
+    $uptimeValue = ([string]$stdoutMap["uptime"]).Trim()
+    if ($uptimeValue.Length -gt 200) { $uptimeValue = $uptimeValue.Substring(0, 200) }
+    $ipConfigValue = ([string]$stdoutMap["ip_config"]).Trim()
+    if ($ipConfigValue.Length -gt 500) { $ipConfigValue = $ipConfigValue.Substring(0, 500) }
+    $portsValue = ([string]$stdoutMap["listening_ports"]).Trim()
+    if ($portsValue.Length -gt 1000) { $portsValue = $portsValue.Substring(0, 1000) }
+
     $deviceInfo = [PSCustomObject]@{
-        hostname        = $stdoutMap["hostname"].Trim()
-        os              = ($stdoutMap["os_release"] ?: $stdoutMap["os_info"] ?: "").Trim().Substring(0, [Math]::Min(200, ($stdoutMap["os_release"] ?: $stdoutMap["os_info"] ?: "").Length))
-        architecture    = $stdoutMap["architecture"].Trim()
-        kernel          = $stdoutMap["kernel"].Trim()
-        uptime          = ($stdoutMap["uptime"] ?: "").Trim().Substring(0, [Math]::Min(200, ($stdoutMap["uptime"] ?: "").Length))
-        ip_config       = ($stdoutMap["ip_config"] ?: "").Trim().Substring(0, [Math]::Min(500, ($stdoutMap["ip_config"] ?: "").Length))
-        default_gateway = ($stdoutMap["default_gateway"] ?: "").Trim()
-        dns_servers     = ($stdoutMap["dns_servers"] ?: "").Trim()
-        listening_ports = ($stdoutMap["listening_ports"] ?: "").Trim().Substring(0, [Math]::Min(1000, ($stdoutMap["listening_ports"] ?: "").Length))
+        hostname        = ([string]$stdoutMap["hostname"]).Trim()
+        os              = $osValue
+        architecture    = ([string]$stdoutMap["architecture"]).Trim()
+        kernel          = ([string]$stdoutMap["kernel"]).Trim()
+        uptime          = $uptimeValue
+        ip_config       = $ipConfigValue
+        default_gateway = ([string]$stdoutMap["default_gateway"]).Trim()
+        dns_servers     = ([string]$stdoutMap["dns_servers"]).Trim()
+        listening_ports = $portsValue
     }
 
     $apps = Parse-Applications -StdoutMap $stdoutMap -OsType $OsType
 
     $authMethod = "unknown"
     if ($AuthArgs -contains "-i") { $authMethod = "key" }
-    elseif ($AuthArgs -like "*-pw*") { $authMethod = "password" }
+    elseif ($AuthArgs -contains "-pwfile") { $authMethod = "password" }
 
     $report = [PSCustomObject]@{
         scan_metadata = [PSCustomObject]@{
@@ -496,11 +581,11 @@ function Save-Report {
     if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $hostname = $Report.device_info.hostname -replace "\s", "_"
-    $target = $Report.scan_metadata.target -replace "\.", "_"
+    $hostname = ConvertTo-SafeFileName -Value $Report.device_info.hostname -Fallback "unknown"
+    $target = ConvertTo-SafeFileName -Value ($Report.scan_metadata.target -replace "\.", "_") -Fallback "target"
 
     $filename = "device_enum_${hostname}_${target}_${timestamp}.json"
-    $filepath = Join-Path $OutputDir $filename
+    $filepath = Join-SafeOutputPath -OutputDir $OutputDir -FileName $filename
 
     $Report | ConvertTo-Json -Depth 5 | Out-File -FilePath $filepath -Encoding UTF8
     return $filepath
@@ -566,33 +651,76 @@ if (-not $Quiet) {
 
 if (-not (Test-Plink)) { exit 1 }
 
-$authArgs = @()
-if ($Key) { $authArgs += "-i", $Key }
-if ($Password) { $authArgs += "-pw", $Password }
-
-if ($Command) {
-    if (-not $Quiet) { Write-Host "`n[ENUM] Running custom command on $Target..." -ForegroundColor Magenta }
-    $result = Invoke-PlinkCommand -Target $Target -Port $Port -User $User `
-        -Cmd $Command -AuthArgs $authArgs -Timeout $Timeout -Verbose $Verbose
-    Write-Host $result.stdout
-    if ($result.stderr) { Write-Host "[STDERR] $($result.stderr)" -ForegroundColor Red }
-    exit $result.exitcode
-}
-
-$report = Enumerate-Device `
-    -Target $Target -Port $Port -User $User -AuthArgs $authArgs `
-    -OsType $OsType -Timeout $Timeout -Batch $Batch `
-    -Verbose:$Verbose -Quiet:$Quiet
-
-if (-not $report) {
-    Write-Host "[ERROR] Enumeration failed." -ForegroundColor Red
+if ($PasswordFile -and $AskPassword) {
+    Write-Host "[ERROR] Use only one of -PasswordFile or -AskPassword." -ForegroundColor Red
     exit 1
 }
 
-$filepath = Save-Report -Report $report -OutputDir $OutputDir
+if (-not $HostKey -and -not $InsecureHostKey) {
+    Write-Host "[ERROR] Host key verification is required to protect credentials from" -ForegroundColor Red
+    Write-Host "        man-in-the-middle attacks. Pass -HostKey <fingerprint> or, only" -ForegroundColor Red
+    Write-Host "        if you accept that risk, -InsecureHostKey." -ForegroundColor Red
+    exit 1
+}
 
-if (-not $Quiet) {
-    Print-Summary -Report $report -Filepath $filepath
-} else {
-    Write-Host "Report saved to: $filepath"
+$authArgs = @()
+if ($Key) {
+    if (-not (Test-Path -LiteralPath $Key)) {
+        Write-Host "[ERROR] SSH key not found: $Key" -ForegroundColor Red
+        exit 1
+    }
+    $authArgs += "-i", (Resolve-Path -LiteralPath $Key).Path
+}
+if ($HostKey) {
+    $authArgs += "-hostkey", $HostKey
+} elseif ($InsecureHostKey) {
+    Write-Host "[WARN] -InsecureHostKey set: server identity is NOT verified; MITM is possible." -ForegroundColor Yellow
+}
+
+$pwTemp = $null
+$plainPassword = $null
+try {
+    if ($PasswordFile) {
+        if (-not (Test-Path -LiteralPath $PasswordFile)) { throw "Password file not found: $PasswordFile" }
+        $plainPassword = Get-Content -LiteralPath $PasswordFile -TotalCount 1
+    } elseif ($AskPassword) {
+        $secure = Read-Host -AsSecureString "SSH password"
+        $plainPassword = [System.Net.NetworkCredential]::new("", $secure).Password
+    }
+
+    if ($null -ne $plainPassword) {
+        if ($plainPassword -eq "") { throw "Password is empty." }
+        $pwTemp = New-PasswordFile -Password $plainPassword
+        $authArgs += "-pwfile", $pwTemp
+    }
+
+    if ($Command) {
+        if (-not $Quiet) { Write-Host "`n[ENUM] Running custom command on $Target..." -ForegroundColor Magenta }
+        $result = Invoke-PlinkCommand -Target $Target -Port $Port -User $User `
+            -Cmd $Command -AuthArgs $authArgs -Timeout $Timeout -Verbose $Verbose
+        Write-Host $result.stdout
+        if ($result.stderr) { Write-Host "[STDERR] $($result.stderr)" -ForegroundColor Red }
+        exit $result.exitcode
+    }
+
+    $report = Enumerate-Device `
+        -Target $Target -Port $Port -User $User -AuthArgs $authArgs `
+        -OsType $OsType -Timeout $Timeout -Batch $Batch `
+        -Verbose:$Verbose -Quiet:$Quiet
+
+    if (-not $report) {
+        Write-Host "[ERROR] Enumeration failed." -ForegroundColor Red
+        exit 1
+    }
+
+    $filepath = Save-Report -Report $report -OutputDir $OutputDir
+
+    if (-not $Quiet) {
+        Print-Summary -Report $report -Filepath $filepath
+    } else {
+        Write-Host "Report saved to: $filepath"
+    }
+} finally {
+    Remove-PasswordFile -Path $pwTemp
+    $plainPassword = $null
 }
