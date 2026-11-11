@@ -1,0 +1,21 @@
+# Generated scan output: full device and software inventories.
+output/
+scan_index.json
+network_scan_*.json
+device_enum_*.json
+
+# Packet captures and tshark scratch files contain hostnames, HTTP hosts,
+# and User-Agents. They must never be committed.
+*.pcapng
+*.pcap
+flash_capture_*
+flashnet_capture_*
+tshark_stdout.tmp
+
+# Secrets written for `plink -pwfile` (normally deleted immediately).
+flashnet_pw_*
+*.secret
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]

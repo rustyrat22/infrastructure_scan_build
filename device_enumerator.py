@@ -88,6 +88,40 @@ def read_password_file(path):
         return handle.readline().rstrip("\r\n")
 
 
+def secure_output_dir(path):
+    """Create *path* and, on POSIX, restrict it to the owner."""
+    os.makedirs(path, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def secure_file(path):
+    """Restrict *path* to the owner on POSIX."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return path
+
+
+def parse_int_arg(value, option, minimum=None, maximum=None):
+    """Parse a CLI integer and exit with a clear message when invalid."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        sys.exit(f"[ERROR] {option} expects an integer, got: {value!r}")
+    if minimum is not None and number < minimum:
+        sys.exit(f"[ERROR] {option} must be >= {minimum}, got: {number}")
+    if maximum is not None and number > maximum:
+        sys.exit(f"[ERROR] {option} must be <= {maximum}, got: {number}")
+    return number
+
+
 def check_plink():
     """Check if plink.exe is available on the system."""
     try:
@@ -263,7 +297,7 @@ def get_windows_commands():
         "installed_apps_registry": "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\" /s 2>nul | findstr /C:\"DisplayName\" /C:\"DisplayVersion\" /C:\"Publisher\" /C:\"InstallLocation\" /C:\"InstallDate\"",
         "installed_apps_wow64": "reg query \"HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\" /s 2>nul | findstr /C:\"DisplayName\" /C:\"DisplayVersion\" /C:\"Publisher\" /C:\"InstallLocation\" /C:\"InstallDate\"",
         "winget_apps": "winget list --accept-source-agreements 2>nul",
-        "open_ports": "netstat -ano | findstr LISTENING | head -50",
+        "open_ports": "netstat -ano | findstr LISTENING",
         "services": "sc query state= all | findstr /C:\"SERVICE_NAME\" /C:\"STATE\"",
     }
 
@@ -308,37 +342,56 @@ def parse_linux_packages(stdout):
 
 
 def parse_windows_registry(stdout):
-    """Parse Windows registry uninstall keys into structured dicts."""
+    """Parse Windows registry uninstall keys into structured dicts.
+
+    `reg query /s` emits one field per line. A new DisplayName starts the next
+    application, so fields must accumulate until then or until a blank line.
+    """
     apps = []
-    current = {}
+    current = None
 
-    for line in stdout.strip().split("\n"):
+    for line in stdout.splitlines():
         line = line.strip()
-        if "DisplayName" in line:
-            match = re.search(r"REG_SZ\s+(.+)", line)
-            if match:
-                current["name"] = match.group(1).strip()
-        elif "DisplayVersion" in line:
-            match = re.search(r"REG_SZ\s+(.+)", line)
-            if match:
-                current["version"] = match.group(1).strip()
-        elif "Publisher" in line:
-            match = re.search(r"REG_SZ\s+(.+)", line)
-            if match:
-                current["signer"] = match.group(1).strip()
-        elif "InstallLocation" in line:
-            match = re.search(r"REG_SZ\s+(.+)", line)
-            if match:
-                current["install_location"] = match.group(1).strip()
-        elif "InstallDate" in line:
-            match = re.search(r"REG_SZ\s+(.+)", line)
-            if match:
-                current["last_update"] = match.group(1).strip()
+        if not line:
+            if current and current.get("name"):
+                apps.append(current)
+            current = None
+            continue
 
-        if "name" in current:
-            current.setdefault("url", "")
-            apps.append(current)
-            current = {}
+        match = re.match(
+            r"^(DisplayName|DisplayVersion|Publisher|InstallLocation|InstallDate)\s+REG_\w+\s+(.+)$",
+            line,
+        )
+        if not match:
+            continue
+        field, value = match.group(1), match.group(2).strip()
+
+        if field == "DisplayName":
+            if current and current.get("name"):
+                apps.append(current)
+            current = {
+                "name": value,
+                "version": "",
+                "signer": "",
+                "install_location": "",
+                "url": "",
+                "last_update": "",
+            }
+            continue
+
+        if current is None:
+            continue
+        if field == "DisplayVersion":
+            current["version"] = value
+        elif field == "Publisher":
+            current["signer"] = value
+        elif field == "InstallLocation":
+            current["install_location"] = value
+        elif field == "InstallDate":
+            current["last_update"] = value
+
+    if current and current.get("name"):
+        apps.append(current)
 
     return apps
 
@@ -486,7 +539,7 @@ def enumerate_device(target, port=22, user="root", auth_args=None, os_type=None,
 
 def save_report(report, output_dir="./output"):
     """Save enumeration report to a JSON file inside *output_dir*."""
-    os.makedirs(output_dir, exist_ok=True)
+    secure_output_dir(output_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     hostname = sanitize_filename_component(report["device_info"].get("hostname"), fallback="unknown")
     target = sanitize_filename_component(
@@ -498,6 +551,7 @@ def save_report(report, output_dir="./output"):
 
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+    secure_file(filepath)
 
     return filepath
 
@@ -566,7 +620,7 @@ def main():
             target = args[i + 1]
             i += 2
         elif args[i] in ("-p", "--port") and i + 1 < len(args):
-            port = int(args[i + 1])
+            port = parse_int_arg(args[i + 1], args[i], minimum=1, maximum=65535)
             i += 2
         elif args[i] in ("-u", "--user") and i + 1 < len(args):
             user = args[i + 1]
@@ -610,7 +664,7 @@ def main():
             os_type = args[i + 1].lower()
             i += 2
         elif args[i] == "--timeout" and i + 1 < len(args):
-            timeout = int(args[i + 1])
+            timeout = parse_int_arg(args[i + 1], args[i], minimum=1, maximum=3600)
             i += 2
         elif args[i] == "--batch":
             batch = True
@@ -625,7 +679,10 @@ def main():
             print_usage()
             sys.exit(0)
         else:
-            i += 1
+            sys.exit(f"[ERROR] Unknown option: {args[i]}\n        Use --help for usage.")
+
+    if os_type is not None and os_type not in ("windows", "linux", "macos"):
+        sys.exit(f"[ERROR] Invalid OS type {os_type!r}. Choose windows, linux, or macos.")
 
     if target is None:
         print("[ERROR] Target is required. Use -t <host> or --help for usage.")

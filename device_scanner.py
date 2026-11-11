@@ -22,11 +22,15 @@ import time
 import getpass
 import ipaddress
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import defaultdict
 
 
 # --- Security helpers -------------------------------------------------------
+
+MAX_PING_HOSTS = 65536
+PING_WORKERS = 64
 
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
 WINDOWS_RESERVED_NAMES.update(f"COM{i}" for i in range(1, 10))
@@ -61,6 +65,40 @@ def safe_output_path(output_dir, filename):
     if not contained:
         raise ValueError(f"Refusing to write outside output directory: {filename!r}")
     return candidate
+
+
+def secure_output_dir(path):
+    """Create *path* and, on POSIX, restrict it to the owner."""
+    os.makedirs(path, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def secure_file(path):
+    """Restrict *path* to the owner on POSIX."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return path
+
+
+def parse_int_arg(value, option, minimum=None, maximum=None):
+    """Parse a CLI integer and exit with a clear message when invalid."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        sys.exit(f"[ERROR] {option} expects an integer, got: {value!r}")
+    if minimum is not None and number < minimum:
+        sys.exit(f"[ERROR] {option} must be >= {minimum}, got: {number}")
+    if maximum is not None and number > maximum:
+        sys.exit(f"[ERROR] {option} must be <= {maximum}, got: {number}")
+    return number
 
 
 def write_password_file(password):
@@ -261,31 +299,77 @@ def check_prerequisites(verbose=False):
 
 
 def get_local_network_range():
-    """Auto-detect local network CIDR range."""
+    """Auto-detect the local IPv4 network, or None when it cannot be determined.
+
+    Windows: pair `IPv4 Address` with `Subnet Mask` from ipconfig.
+    POSIX:   use the first `inet A.B.C.D/NN` from `ip -4 addr`.
+    """
     try:
-        result = subprocess.run(
-            ["ipconfig" if sys.platform == "win32" else "ip", "addr" if sys.platform != "win32" else ""],
-            capture_output=True, text=True, timeout=10
-        )
-        output = result.stdout
-        ips = re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})", output)
-        for ip, mask in ips:
-            if not ip.startswith("127.") and int(mask) <= 24:
-                return f"{ip}/{mask}"
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True, timeout=10
+            )
+            text = result.stdout
+            addresses = re.findall(
+                r"IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", text
+            )
+            masks = re.findall(
+                r"Subnet Mask[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", text
+            )
+            for ip, mask in zip(addresses, masks):
+                if ip.startswith("127.") or mask == "0.0.0.0":
+                    continue
+                try:
+                    net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                except ValueError:
+                    continue
+                if 8 <= net.prefixlen <= 30:
+                    return str(net)
+        else:
+            result = subprocess.run(
+                ["ip", "-4", "addr", "show"], capture_output=True, text=True, timeout=10
+            )
+            for match in re.finditer(
+                r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})", result.stdout
+            ):
+                ip, prefix = match.group(1), int(match.group(2))
+                if ip.startswith("127.") or prefix < 8 or prefix > 30:
+                    continue
+                return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
     except Exception:
         pass
-    return "192.168.1.0/24"
+    return None
+
+
+def _ping_host(host, timeout):
+    """Ping a single host; return its address when it replies."""
+    ip = str(host)
+    cmd = (["ping", "-n", "1", "-w", str(timeout * 1000), ip]
+           if sys.platform == "win32"
+           else ["ping", "-c", "1", "-W", str(timeout), ip])
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=max(timeout + 5, 10),
+        )
+        return ip if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def discover_devices_ping(network_range, max_devices=None, timeout=2, verbose=False):
-    """Discover live devices via ICMP ping sweep."""
+    """Discover live devices via ICMP ping sweep with bounded concurrency."""
     try:
         net = ipaddress.ip_network(network_range, strict=False)
     except ValueError:
         print(f"[ERROR] Invalid network range: {network_range}")
         return []
 
-    devices = []
+    if net.num_addresses > MAX_PING_HOSTS:
+        print(f"[ERROR] Range {network_range} contains {net.num_addresses} addresses; "
+              f"refusing to sweep more than {MAX_PING_HOSTS}. Narrow --range.")
+        return []
+
     hosts = list(net.hosts())
     if max_devices:
         hosts = hosts[:max_devices]
@@ -293,19 +377,16 @@ def discover_devices_ping(network_range, max_devices=None, timeout=2, verbose=Fa
     if verbose:
         print(f"\n[PING] Sweeping {len(hosts)} hosts in {network_range}...")
 
-    procs = {}
-    for host in hosts:
-        ip = str(host)
-        cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), ip] if sys.platform == "win32" \
-              else ["ping", "-c", "1", "-W", str(timeout), ip]
-        procs[ip] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    devices = []
+    if not hosts:
+        return devices
 
-    for ip, proc in procs.items():
-        proc.wait()
-        if proc.returncode == 0:
-            devices.append({"ip": ip, "mac": "N/A", "hostname": ip, "method": "ping"})
-            if verbose:
-                print(f"  [+] {ip} is alive")
+    with ThreadPoolExecutor(max_workers=PING_WORKERS) as pool:
+        for ip in pool.map(lambda h: _ping_host(h, timeout), hosts):
+            if ip:
+                devices.append({"ip": ip, "mac": "N/A", "hostname": ip, "method": "ping"})
+                if verbose:
+                    print(f"  [+] {ip} is alive")
 
     return devices
 
@@ -552,7 +633,12 @@ def parse_linux_apps(stdout_map):
 
 
 def parse_windows_apps(stdout_map):
-    """Parse Windows application lists."""
+    """Parse Windows application lists.
+
+    `reg query /s` emits one field per line inside a key block. A new
+    DisplayName starts the next block, so fields must accumulate until then
+    (or until a blank line) instead of being flushed as soon as a name exists.
+    """
     apps = []
 
     for key in ("reg32", "reg64"):
@@ -560,36 +646,54 @@ def parse_windows_apps(stdout_map):
         if not output:
             continue
 
-        current = {}
-        for line in output.strip().split("\n"):
-            line = line.strip()
-            if "DisplayName" in line and "REG_SZ" in line:
-                match = re.search(r"REG_SZ\s+(.+)", line)
-                if match:
-                    current = {
-                        "name": match.group(1).strip(),
-                        "version": "",
-                        "last_update": "",
-                        "signer": "",
-                        "install_location": "",
-                        "url": "",
-                        "publisher": "",
-                        "install_date": "",
-                        "architecture": "x86" if key == "reg32" else "x64",
-                        "source": "registry",
-                    }
-            elif current:
-                for field, reg_key in [("version", "DisplayVersion"), ("publisher", "Publisher"),
-                                        ("signer", "Publisher"), ("install_location", "InstallLocation"),
-                                        ("install_date", "InstallDate"), ("last_update", "InstallDate")]:
-                    if reg_key in line and "REG_SZ" in line:
-                        match = re.search(r"REG_SZ\s+(.+)", line)
-                        if match:
-                            current[field] = match.group(1).strip()
+        current = None
 
-                if current.get("name") and current.get("version"):
-                    apps.append(current)
-                    current = {}
+        def flush(apps=apps, current=None):
+            if current and current.get("name"):
+                apps.append(current)
+            return None
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                current = flush(apps, current)
+                continue
+
+            match = re.match(r"^(DisplayName|DisplayVersion|Publisher|InstallLocation|InstallDate)\s+REG_\w+\s+(.+)$", line)
+            if not match:
+                continue
+            field, value = match.group(1), match.group(2).strip()
+
+            if field == "DisplayName":
+                current = flush(apps, current)
+                current = {
+                    "name": value,
+                    "version": "",
+                    "last_update": "",
+                    "signer": "",
+                    "install_location": "",
+                    "url": "",
+                    "publisher": "",
+                    "install_date": "",
+                    "architecture": "x86" if key == "reg32" else "x64",
+                    "source": "registry",
+                }
+                continue
+
+            if current is None:
+                continue
+            if field == "DisplayVersion":
+                current["version"] = value
+            elif field == "Publisher":
+                current["publisher"] = value
+                current["signer"] = value
+            elif field == "InstallLocation":
+                current["install_location"] = value
+            elif field == "InstallDate":
+                current["install_date"] = value
+                current["last_update"] = value
+
+        flush(apps, current)
 
     # winget
     winget_out = stdout_map.get("winget", "")
@@ -711,17 +815,17 @@ def build_device_json(device_info, enum_result, ip, mac, timestamp):
     """Build the final standardized JSON structure for a device."""
     return {
         "device": {
-            "hostname": enum_result.get("hostname", device_info.get("hostname", ip)),
+            "hostname": enum_result.get("hostname") or device_info.get("hostname") or ip,
             "ip_address": ip,
             "mac_address": mac,
-            "os": enum_result.get("os", "Unknown"),
-            "architecture": enum_result.get("architecture", ""),
+            "os": enum_result.get("os") or "Unknown",
+            "architecture": enum_result.get("architecture") or "",
             "scan_timestamp": timestamp,
             "scan_methods": enum_result.get("scan_methods", []),
         },
-        "applications": enum_result.get("applications", []),
+        "applications": enum_result.get("applications") or [],
         "scan_summary": {
-            "total_applications": len(enum_result.get("applications", [])),
+            "total_applications": len(enum_result.get("applications") or []),
             "scan_duration_seconds": enum_result.get("duration", 0),
             "errors": enum_result.get("errors", []),
         },
@@ -730,7 +834,7 @@ def build_device_json(device_info, enum_result, ip, mac, timestamp):
 
 def save_device_json(report, output_dir, ip, hostname):
     """Save device report to a JSON file inside *output_dir*."""
-    os.makedirs(output_dir, exist_ok=True)
+    secure_output_dir(output_dir)
     safe_hostname = sanitize_filename_component(hostname or ip)
     safe_ip = sanitize_filename_component(str(ip).replace(".", "_"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -740,6 +844,7 @@ def save_device_json(report, output_dir, ip, hostname):
 
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+    secure_file(filepath)
 
     return filepath
 
@@ -765,6 +870,10 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
 
     if not network_range:
         network_range = get_local_network_range()
+        if not network_range:
+            print("[ERROR] Could not auto-detect a usable IPv4 network. "
+                  "Pass --range/-r explicitly.")
+            sys.exit(1)
         if not quiet:
             print(f"[AUTO] Detected network range: {network_range}")
 
@@ -794,7 +903,9 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
             enum_result = enumerate_device(ip, port, user, auth_args, timeout, verbose)
 
             report = build_device_json(dev, enum_result, ip, mac, timestamp)
-            filepath = save_device_json(report, output_dir, ip, enum_result.get("hostname", hostname))
+            filepath = save_device_json(
+                report, output_dir, ip, enum_result.get("hostname") or hostname
+            )
 
             results.append({"ip": ip, "hostname": hostname, "status": "success", "file": filepath,
                             "apps": len(report["applications"]), "duration": enum_result["duration"]})
@@ -813,7 +924,7 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
     total_apps = sum(r.get("apps", 0) for r in results if r["status"] == "success")
 
     # Write scan index
-    os.makedirs(output_dir, exist_ok=True)
+    secure_output_dir(output_dir)
     index = {
         "scan_timestamp": datetime.now(timezone.utc).isoformat(),
         "network_range": network_range,
@@ -827,6 +938,7 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
     index_path = os.path.join(output_dir, "scan_index.json")
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
+    secure_file(index_path)
 
     if not quiet:
         print("\n" + "=" * 60)
@@ -871,13 +983,13 @@ def main():
             mode = args[i + 1]
             i += 2
         elif args[i] in ("-i", "--interface") and i + 1 < len(args):
-            interface_idx = int(args[i + 1])
+            interface_idx = parse_int_arg(args[i + 1], args[i], minimum=0)
             i += 2
         elif args[i] in ("-n", "--max-devices") and i + 1 < len(args):
-            max_devices = int(args[i + 1])
+            max_devices = parse_int_arg(args[i + 1], args[i], minimum=1)
             i += 2
         elif args[i] in ("-p", "--port") and i + 1 < len(args):
-            port = int(args[i + 1])
+            port = parse_int_arg(args[i + 1], args[i], minimum=1, maximum=65535)
             i += 2
         elif args[i] in ("-u", "--user") and i + 1 < len(args):
             user = args[i + 1]
@@ -915,7 +1027,7 @@ def main():
             output_dir = args[i + 1]
             i += 2
         elif args[i] in ("-t", "--timeout") and i + 1 < len(args):
-            timeout = int(args[i + 1])
+            timeout = parse_int_arg(args[i + 1], args[i], minimum=1, maximum=3600)
             i += 2
         elif args[i] == "--list-interfaces":
             try:
@@ -936,7 +1048,13 @@ def main():
             print_usage()
             sys.exit(0)
         else:
-            i += 1
+            sys.exit(f"[ERROR] Unknown option: {args[i]}\n        Use --help for usage.")
+
+    valid_modes = ("ping", "arp", "tshark", "all")
+    if mode not in valid_modes:
+        sys.exit(f"[ERROR] Invalid mode {mode!r}. Choose one of: {', '.join(valid_modes)}.")
+    if mode == "tshark" and interface_idx is None:
+        sys.exit("[ERROR] --mode tshark requires --interface INDEX (see --list-interfaces).")
 
     selected_password_sources = sum(bool(v) for v in (password_file, password_stdin, ask_password))
     if selected_password_sources > 1:

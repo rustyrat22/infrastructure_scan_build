@@ -14,6 +14,13 @@
 .PARAMETER Interface
     Network interface index (default: auto-detect first non-loopback)
 
+.PARAMETER OutputDir
+    Output directory for the JSON report (default: output)
+
+.PARAMETER KeepPcap
+    Keep the temporary capture file. By default it is created in the system
+    temp directory with owner-only permissions and deleted after analysis.
+
 .EXAMPLE
     .\network_scanner.ps1
     .\network_scanner.ps1 -Duration 30
@@ -22,10 +29,13 @@
 
 param(
     [int]$Duration = 15,
-    [int]$Interface = -1
+    [int]$Interface = -1,
+    [string]$OutputDir = "output",
+    [switch]$KeepPcap = $false
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Write-Header {
@@ -42,6 +52,122 @@ function Write-Section {
     Write-Host ("-" * 60) -ForegroundColor Yellow
     Write-Host "  $Text" -ForegroundColor Yellow
     Write-Host ("-" * 60) -ForegroundColor Yellow
+}
+
+function ConvertTo-ProcessArgument {
+    # Quote one argument using the Windows CommandLineToArgvW rules. Start-Process
+    # joins ArgumentList with spaces and lets the child re-parse it.
+    param([string]$Value)
+    if ($null -eq $Value -or $Value -eq "") { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$builder.Append('\' * (($backslashes * 2) + 1))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append('\' * $backslashes)
+            $backslashes = 0
+        }
+        [void]$builder.Append($ch)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append('\' * ($backslashes * 2)) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+    $quoted = foreach ($arg in $Arguments) { ConvertTo-ProcessArgument -Value $arg }
+    return ($quoted -join ' ')
+}
+
+function Invoke-ProcessWithTimeout {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds,
+        [string]$StdOutPath = "",
+        [string]$StdErrPath = ""
+    )
+
+    $startParams = @{
+        FilePath     = $FilePath
+        ArgumentList = (Join-ProcessArguments -Arguments $Arguments)
+        NoNewWindow  = $true
+        PassThru     = $true
+    }
+    if ($StdOutPath) { $startParams.RedirectStandardOutput = $StdOutPath }
+    if ($StdErrPath) { $startParams.RedirectStandardError = $StdErrPath }
+
+    $process = Start-Process @startParams
+    $timedOut = $false
+
+    try {
+        if ($TimeoutSeconds -le 0) {
+            $process.WaitForExit()
+        } elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $timedOut = $true
+            try { $process.Kill() } catch { }
+            try { [void]$process.WaitForExit(2000) } catch { }
+        }
+    } catch {
+        try { $process.Kill() } catch { }
+        throw
+    }
+
+    $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
+    return @{ Process = $process; TimedOut = $timedOut; ExitCode = $exitCode }
+}
+
+function Set-RestrictiveFileAcl {
+    param([string]$Path)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } else {
+            & chmod 600 $Path 2>$null
+        }
+    } catch { }
+}
+
+function Set-RestrictiveDirectoryAcl {
+    param([string]$Path)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } else {
+            & chmod 700 $Path 2>$null
+        }
+    } catch { }
+}
+
+function New-TemporaryCaptureFile {
+    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+        "flashnet_capture_" + [guid]::NewGuid().ToString("N") + ".pcapng")
+    $stream = [System.IO.File]::Create($path)
+    $stream.Close()
+    Set-RestrictiveFileAcl -Path $path
+    return $path
 }
 
 function Test-Tshark {
@@ -86,7 +212,9 @@ function Get-Interfaces {
 function Get-ActiveInterface {
     param([array]$Interfaces)
     foreach ($iface in $Interfaces) {
-        if ($iface.Description -notmatch "Loopback|Pseudo" -and $iface.Name -notmatch "Loopback|NPF_") {
+        # Real tshark adapters are named \Device\NPF_{GUID}; only loopback and
+        # pseudo devices should be skipped.
+        if ($iface.Description -notmatch "Loopback|Pseudo" -and $iface.Name -notmatch "Loopback") {
             return $iface
         }
     }
@@ -99,8 +227,7 @@ function Capture-Traffic {
         [int]$Duration
     )
 
-    $timestamp = [int][decimal]::Parse((Get-Date -UFormat %s))
-    $pcapFile = "flash_capture_$timestamp.pcapng"
+    $pcapFile = New-TemporaryCaptureFile
 
     $fields = @(
         "frame.time_epoch", "frame.number", "eth.src", "eth.dst",
@@ -122,27 +249,38 @@ function Capture-Traffic {
 
     Write-Host ""
     Write-Host "[CAPTURE] Capturing ${Duration}s on interface $($Interface.Name) ($($Interface.Description))..." -ForegroundColor Magenta
-    Write-Host "          Saved to: $pcapFile"
+    Write-Host "          Temporary capture: $pcapFile"
 
-    $process = Start-Process -FilePath "tshark" -ArgumentList $cmdArgs `
-        -NoNewWindow -Wait -PassThru -RedirectStandardOutput "tshark_stdout.tmp"
-
-    $packets = @()
-    if (Test-Path "tshark_stdout.tmp") {
-        $lines = Get-Content "tshark_stdout.tmp" -Encoding UTF8
-        foreach ($line in $lines) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $parts = $line -split '\|'
-            $pkt = [ordered]@{}
-            for ($i = 0; $i -lt $fields.Count; $i++) {
-                $pkt[$fields[$i]] = if ($i -lt $parts.Count) { $parts[$i].Trim() } else { "" }
-            }
-            $packets += $pkt
+    $tmpOut = [System.IO.Path]::GetTempFileName()
+    $packets = New-Object System.Collections.Generic.List[object]
+    try {
+        $run = Invoke-ProcessWithTimeout -FilePath "tshark" -Arguments $cmdArgs `
+            -TimeoutSeconds ($Duration + 60) -StdOutPath $tmpOut
+        if ($run.TimedOut) {
+            Write-Host "[WARN] tshark capture timed out after $($Duration + 60)s" -ForegroundColor Yellow
         }
-        Remove-Item "tshark_stdout.tmp" -Force -ErrorAction SilentlyContinue
+
+        if (Test-Path -LiteralPath $tmpOut) {
+            $lines = Get-Content -LiteralPath $tmpOut -Encoding UTF8
+            foreach ($line in $lines) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                if ($packets.Count -ge 200000) {
+                    Write-Host "[WARN] Capture exceeded 200000 packets; analysis truncated." -ForegroundColor Yellow
+                    break
+                }
+                $parts = $line -split '\|'
+                $pkt = [ordered]@{}
+                for ($i = 0; $i -lt $fields.Count; $i++) {
+                    $pkt[$fields[$i]] = if ($i -lt $parts.Count) { $parts[$i].Trim() } else { "" }
+                }
+                $packets.Add($pkt)
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
     }
 
-    return $pcapFile, $packets
+    return $pcapFile, $packets.ToArray()
 }
 
 function Analyze-Packets {
@@ -150,15 +288,16 @@ function Analyze-Packets {
 
     $devices = @{}
     $protocolCounts = @{}
-    $timeline = @()
+    $timeline = New-Object System.Collections.Generic.List[object]
     $totalBytes = 0
+    $timelineStride = [Math]::Max(1, [int]($Packets.Count / 20000))
+    $packetIndex = 0
 
     foreach ($pkt in $Packets) {
         $srcMac   = $pkt["eth.src"]
         $dstMac   = $pkt["eth.dst"]
         $srcIp    = $pkt["ip.src"]
         $dstIp    = $pkt["ip.dst"]
-        $frameLen = [int]$pkt["frame.len"]
         $proto    = $pkt["_ws.col.Protocol"]
         $hostname = $pkt["dhcp.options.hostname"]
         $httpHost = $pkt["http.host"]
@@ -166,19 +305,31 @@ function Analyze-Packets {
         $mdnsName = $pkt["mdns.host_name"]
         $epoch    = $pkt["frame.time_epoch"]
 
+        $frameLen = 0
+        [void][int]::TryParse([string]$pkt["frame.len"], [ref]$frameLen)
+
         if ([string]::IsNullOrWhiteSpace($srcMac) -and [string]::IsNullOrWhiteSpace($srcIp)) {
+            $packetIndex++
             continue
         }
 
         $totalBytes += $frameLen
 
         if ($proto) {
-            $protocolCounts[$proto] = ($protocolCounts[$proto] + 1)
+            if ($protocolCounts.ContainsKey($proto)) { $protocolCounts[$proto]++ }
+            else { $protocolCounts[$proto] = 1 }
         }
 
-        if ($epoch) {
-            $timeline += @{ time=[double]$epoch; len=$frameLen; proto=$proto }
+        $epochValue = 0.0
+        $epochOk = [double]::TryParse(
+            [string]$epoch,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$epochValue)
+        if ($epochOk -and $epochValue -gt 0 -and ($packetIndex % $timelineStride) -eq 0) {
+            $timeline.Add(@{ time = $epochValue; len = $frameLen; proto = $proto })
         }
+        $packetIndex++
 
         foreach ($entry in @(
             @{ mac=$srcMac; ip=$srcIp; dir="sent" },
@@ -217,20 +368,31 @@ function Analyze-Packets {
             }
         }
 
-        if ($hostname -and [string]::IsNullOrWhiteSpace($devices[$srcMac].hostname)) {
-            $devices[$srcMac].hostname = $hostname
+        # Hints belong to the source MAC only. Guard the key check so an empty
+        # or destination-only MAC cannot throw or create a phantom device.
+        if ([string]::IsNullOrWhiteSpace($srcMac) -or -not $devices.ContainsKey($srcMac)) {
+            continue
         }
-        if ($mdnsName -and [string]::IsNullOrWhiteSpace($devices[$srcMac].hostname)) {
-            $devices[$srcMac].hostname = $mdnsName
+        $srcDev = $devices[$srcMac]
+
+        if ($hostname -and [string]::IsNullOrWhiteSpace($srcDev.hostname)) {
+            $srcDev.hostname = $hostname
+        }
+        if ($mdnsName -and [string]::IsNullOrWhiteSpace($srcDev.hostname)) {
+            $srcDev.hostname = $mdnsName
         }
         if ($userAgent) {
-            $devices[$srcMac].hints.Add("UA: $userAgent") | Out-Null
+            $srcDev.hints.Add("UA: $userAgent") | Out-Null
             $uaLower = $userAgent.ToLower()
-            if ($uaLower -match "windows") { $devices[$srcMac].device_type = "Windows PC" }
-            elseif ($uaLower -match "linux") { $devices[$srcMac].device_type = "Linux" }
-            elseif ($uaLower -match "macintosh|darwin") { $devices[$srcMac].device_type = "macOS" }
-            elseif ($uaLower -match "android") { $devices[$srcMac].device_type = "Android" }
-            elseif ($uaLower -match "iphone|ipad") { $devices[$srcMac].device_type = "iOS" }
+            # Mobile first: Android UAs contain "Linux", iOS UAs contain "Macintosh".
+            if ($uaLower -match "android") { $srcDev.device_type = "Android" }
+            elseif ($uaLower -match "iphone|ipad") { $srcDev.device_type = "iOS" }
+            elseif ($uaLower -match "windows") { $srcDev.device_type = "Windows PC" }
+            elseif ($uaLower -match "macintosh|darwin") { $srcDev.device_type = "macOS" }
+            elseif ($uaLower -match "linux") { $srcDev.device_type = "Linux" }
+        }
+        if ($httpHost) {
+            $srcDev.hints.Add("HTTP Host: $httpHost") | Out-Null
         }
     }
 
@@ -238,23 +400,25 @@ function Analyze-Packets {
         devices = $devices
         totalBytes = $totalBytes
         protocolCounts = $protocolCounts
-        timeline = $timeline
+        timeline = $timeline.ToArray()
     }
 }
 
 function Calculate-Throughput {
-    param([array]$Timeline)
+    param([array]$Timeline, [long]$TotalBytes = -1, [int]$TotalPackets = -1)
 
-    if ($Timeline.Count -eq 0) {
+    if (-not $Timeline -or $Timeline.Count -eq 0) {
         return @{ avg_bps=0; peak_bps=0; total_bytes=0; duration_sec=0 }
     }
 
-    $sorted = $Timeline | Sort-Object { $_.time }
-    $start = $sorted[0].time
-    $end = $sorted[-1].time
-    $duration = [Math]::Max($end - $start, 0.001)
-    $totalBytes = ($sorted | Measure-Object -Property len -Sum).Sum
-    $avgBps = ($totalBytes * 8) / $duration
+    $sorted = @($Timeline | Sort-Object { $_.time })
+    $start = [double]$sorted[0].time
+    $end = [double]$sorted[$sorted.Count - 1].time
+    $duration = [Math]::Max($end - $start, [double]0.001)
+    if ($TotalBytes -lt 0) {
+        $TotalBytes = ($sorted | Measure-Object -Property len -Sum).Sum
+    }
+    $avgBps = ($TotalBytes * 8) / $duration
 
     $windows = @{}
     foreach ($p in $sorted) {
@@ -269,14 +433,17 @@ function Calculate-Throughput {
     }
     $peakBps = ($peakBytes * 8) / 1.0
 
+    $packetCount = if ($TotalPackets -ge 0) { $TotalPackets } else { $sorted.Count }
+
     return @{
         avg_bps = [Math]::Round($avgBps, 2)
         avg_mbps = [Math]::Round($avgBps / 1000000, 4)
         peak_bps = [Math]::Round($peakBps, 2)
         peak_mbps = [Math]::Round($peakBps / 1000000, 4)
-        total_bytes = $totalBytes
+        total_bytes = $TotalBytes
         duration_sec = [Math]::Round($duration, 2)
-        total_packets = $sorted.Count
+        total_packets = $packetCount
+        timeline_sampled = ($packetCount -gt $sorted.Count)
     }
 }
 
@@ -287,7 +454,8 @@ function Generate-Report {
         [hashtable]$ProtocolCounts,
         [PSCustomObject]$Interface,
         [int]$Duration,
-        [string]$CaptureFile
+        [string]$CaptureFile,
+        [string]$OutputDir = "output"
     )
 
     $deviceList = @()
@@ -297,10 +465,10 @@ function Generate-Report {
         $dev = $entry.Value
         $deviceList += [PSCustomObject]@{
             mac_address = $dev.mac
-            ip_addresses = @($dev.ips) | Sort-Object
+            ip_addresses = @($dev.ips | Sort-Object)
             hostname = if ($dev.hostname) { $dev.hostname } else { "N/A" }
             device_type = $dev.device_type
-            protocols_observed = @($dev.protocols) | Sort-Object
+            protocols_observed = @($dev.protocols | Sort-Object)
             traffic = [PSCustomObject]@{
                 bytes_sent = $dev.bytes_sent
                 bytes_received = $dev.bytes_received
@@ -327,11 +495,14 @@ function Generate-Report {
     }
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $outputDir = "output"
-    if (!(Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir | Out-Null }
+    if (!(Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir | Out-Null
+        Set-RestrictiveDirectoryAcl -Path $OutputDir
+    }
 
-    $jsonPath = Join-Path $outputDir "network_scan_$timestamp.json"
+    $jsonPath = Join-Path $OutputDir "network_scan_$timestamp.json"
     $report | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonPath -Encoding UTF8
+    Set-RestrictiveFileAcl -Path $jsonPath
 
     return $report, $jsonPath
 }
@@ -389,9 +560,19 @@ function Print-Summary {
 # Main
 Write-Header "Flash_Network — Wireshark Network Scanner (PowerShell)"
 
+if ($args.Count -gt 0) {
+    Write-Host "[ERROR] Unknown argument(s): $($args -join ' ')." -ForegroundColor Red
+    exit 1
+}
+
+if ($Duration -lt 1 -or $Duration -gt 3600) {
+    Write-Host "[ERROR] -Duration must be between 1 and 3600 seconds." -ForegroundColor Red
+    exit 1
+}
+
 if (-not (Test-Tshark)) { exit 1 }
 
-$interfaces = Get-Interfaces
+$interfaces = @(Get-Interfaces)
 if ($interfaces.Count -eq 0) {
     Write-Host "[ERROR] No network interfaces found." -ForegroundColor Red
     exit 1
@@ -405,6 +586,10 @@ foreach ($iface in $interfaces) {
 
 if ($Interface -ge 0) {
     $selected = $interfaces | Where-Object { $_.Index -eq $Interface } | Select-Object -First 1
+    if (-not $selected) {
+        Write-Host "[ERROR] Interface index $Interface not found." -ForegroundColor Red
+        exit 1
+    }
 } else {
     $selected = Get-ActiveInterface -Interfaces $interfaces
 }
@@ -417,25 +602,37 @@ if (-not $selected) {
 Write-Host ""
 Write-Host "  Selected: [$($selected.Index)] $($selected.Description)" -ForegroundColor Green
 
-$captureFile, $packets = Capture-Traffic -Interface $selected -Duration $Duration
+$captureFile, $packetOutput = Capture-Traffic -Interface $selected -Duration $Duration
+# The pipeline unrolls a single packet to a scalar and emits nothing for an
+# empty capture; normalise both cases to an array.
+$packets = @()
+if ($null -ne $packetOutput) { $packets = @($packetOutput) }
 
-if ($packets.Count -eq 0) {
-    Write-Host "[WARN] No packets captured. Run as Administrator or check interface." -ForegroundColor Yellow
-    exit 0
+try {
+    if ($packets.Count -eq 0) {
+        Write-Host "[WARN] No packets captured. Run as Administrator or check interface." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "[ANALYSIS] Processing $($packets.Count) packets..." -ForegroundColor Magenta
+
+        $analysis = Analyze-Packets -Packets $packets
+        $throughput = Calculate-Throughput -Timeline $analysis.timeline `
+            -TotalBytes $analysis.totalBytes -TotalPackets $packets.Count
+
+        $retained = if ($KeepPcap) { $captureFile } else { "(not retained)" }
+        $report, $outputPath = Generate-Report `
+            -Devices $analysis.devices `
+            -Throughput $throughput `
+            -ProtocolCounts $analysis.protocolCounts `
+            -Interface $selected `
+            -Duration $Duration `
+            -CaptureFile $retained `
+            -OutputDir $OutputDir
+
+        Print-Summary -Report $report -OutputPath $outputPath
+    }
+} finally {
+    if (-not $KeepPcap -and $captureFile -and (Test-Path -LiteralPath $captureFile)) {
+        Remove-Item -LiteralPath $captureFile -Force -ErrorAction SilentlyContinue
+    }
 }
-
-Write-Host ""
-Write-Host "[ANALYSIS] Processing $($packets.Count) packets..." -ForegroundColor Magenta
-
-$analysis = Analyze-Packets -Packets $packets
-$throughput = Calculate-Throughput -Timeline $analysis.timeline
-
-$report, $outputPath = Generate-Report `
-    -Devices $analysis.devices `
-    -Throughput $throughput `
-    -ProtocolCounts $analysis.protocolCounts `
-    -Interface $selected `
-    -Duration $Duration `
-    -CaptureFile $captureFile
-
-Print-Summary -Report $report -OutputPath $outputPath

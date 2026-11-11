@@ -87,6 +87,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Write-Header {
@@ -233,6 +234,114 @@ function Test-Plink {
     return $false
 }
 
+function ConvertTo-ProcessArgument {
+    # Quote one argument using the Windows CommandLineToArgvW rules that
+    # .NET/plink use. Start-Process joins ArgumentList with spaces and lets the
+    # child re-parse it, so paths and commands must be quoted explicitly.
+    param([string]$Value)
+    if ($null -eq $Value -or $Value -eq "") { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$builder.Append('\' * (($backslashes * 2) + 1))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append('\' * $backslashes)
+            $backslashes = 0
+        }
+        [void]$builder.Append($ch)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append('\' * ($backslashes * 2)) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+    $quoted = foreach ($arg in $Arguments) { ConvertTo-ProcessArgument -Value $arg }
+    return ($quoted -join ' ')
+}
+
+function Invoke-ProcessWithTimeout {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds,
+        [string]$StdOutPath = "",
+        [string]$StdErrPath = ""
+    )
+
+    $startParams = @{
+        FilePath     = $FilePath
+        ArgumentList = (Join-ProcessArguments -Arguments $Arguments)
+        NoNewWindow  = $true
+        PassThru     = $true
+    }
+    if ($StdOutPath) { $startParams.RedirectStandardOutput = $StdOutPath }
+    if ($StdErrPath) { $startParams.RedirectStandardError = $StdErrPath }
+
+    $process = Start-Process @startParams
+    $timedOut = $false
+
+    try {
+        if ($TimeoutSeconds -le 0) {
+            $process.WaitForExit()
+        } elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $timedOut = $true
+            try { $process.Kill() } catch { }
+            try { [void]$process.WaitForExit(2000) } catch { }
+        }
+    } catch {
+        try { $process.Kill() } catch { }
+        throw
+    }
+
+    $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
+    return @{ Process = $process; TimedOut = $timedOut; ExitCode = $exitCode }
+}
+
+function Set-RestrictiveFileAcl {
+    param([string]$Path)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } else {
+            & chmod 600 $Path 2>$null
+        }
+    } catch { }
+}
+
+function Set-RestrictiveDirectoryAcl {
+    param([string]$Path)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } else {
+            & chmod 700 $Path 2>$null
+        }
+    } catch { }
+}
+
 function Invoke-PlinkCommand {
     param(
         [string]$Target,
@@ -259,26 +368,29 @@ function Invoke-PlinkCommand {
     $tmpOut = [System.IO.Path]::GetTempFileName()
     $tmpErr = [System.IO.Path]::GetTempFileName()
 
-    $process = Start-Process -FilePath "plink" -ArgumentList $cmdArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $tmpOut `
-        -RedirectStandardError $tmpErr
+    $run = Invoke-ProcessWithTimeout -FilePath "plink" -Arguments $cmdArgs `
+        -TimeoutSeconds $Timeout -StdOutPath $tmpOut -StdErrPath $tmpErr
 
     $stdout = ""
     $stderr = ""
-    if (Test-Path $tmpOut) {
-        $stdout = Get-Content $tmpOut -Raw -Encoding UTF8
-        Remove-Item $tmpOut -Force
+    if (Test-Path -LiteralPath $tmpOut) {
+        $stdout = Get-Content -LiteralPath $tmpOut -Raw -Encoding UTF8
+        Remove-Item -LiteralPath $tmpOut -Force
     }
-    if (Test-Path $tmpErr) {
-        $stderr = Get-Content $tmpErr -Raw -Encoding UTF8
-        Remove-Item $tmpErr -Force
+    if (Test-Path -LiteralPath $tmpErr) {
+        $stderr = Get-Content -LiteralPath $tmpErr -Raw -Encoding UTF8
+        Remove-Item -LiteralPath $tmpErr -Force
+    }
+
+    if ($run.TimedOut) {
+        if ($stderr) { $stderr += "`n" }
+        $stderr += "Command timed out after ${Timeout}s"
     }
 
     return @{
         stdout = $stdout
         stderr = $stderr
-        exitcode = $process.ExitCode
+        exitcode = $run.ExitCode
     }
 }
 
@@ -550,7 +662,7 @@ function Enumerate-Device {
         listening_ports = $portsValue
     }
 
-    $apps = Parse-Applications -StdoutMap $stdoutMap -OsType $OsType
+    $apps = @(Parse-Applications -StdoutMap $stdoutMap -OsType $OsType)
 
     $authMethod = "unknown"
     if ($AuthArgs -contains "-i") { $authMethod = "key" }
@@ -578,7 +690,10 @@ function Enumerate-Device {
 function Save-Report {
     param([PSCustomObject]$Report, [string]$OutputDir = "./output/")
 
-    if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+    if (!(Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir | Out-Null
+        Set-RestrictiveDirectoryAcl -Path $OutputDir
+    }
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $hostname = ConvertTo-SafeFileName -Value $Report.device_info.hostname -Fallback "unknown"
@@ -588,6 +703,7 @@ function Save-Report {
     $filepath = Join-SafeOutputPath -OutputDir $OutputDir -FileName $filename
 
     $Report | ConvertTo-Json -Depth 5 | Out-File -FilePath $filepath -Encoding UTF8
+    Set-RestrictiveFileAcl -Path $filepath
     return $filepath
 }
 
@@ -639,6 +755,11 @@ function Print-Summary {
 
 # Main
 if ($Help) { Write-Usage; exit 0 }
+
+if ($args.Count -gt 0) {
+    Write-Host "[ERROR] Unknown argument(s): $($args -join ' '). Use -Help for usage." -ForegroundColor Red
+    exit 1
+}
 
 if (-not $Target) {
     Write-Host "[ERROR] Target is required. Use -Target <host> or -Help for usage." -ForegroundColor Red

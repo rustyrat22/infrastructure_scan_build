@@ -12,10 +12,84 @@ import subprocess
 import sys
 import json
 import os
-import time
 import re
+import tempfile
 from datetime import datetime, timezone
 from collections import defaultdict
+
+
+# Capture safety limits. A long scan must not grow memory without bound.
+MAX_CAPTURE_PACKETS = 200_000
+MAX_TIMELINE_POINTS = 20_000
+
+
+def secure_output_dir(path):
+    """Create *path* and, on POSIX, restrict it to the owner."""
+    os.makedirs(path, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def secure_file(path):
+    """Restrict *path* to the owner on POSIX."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return path
+
+
+def safe_int(value, default=0):
+    """Parse an integer, returning *default* for blank or malformed input."""
+    try:
+        text = str(value).strip()
+        if not text:
+            return default
+        return int(float(text)) if ("." in text or "e" in text.lower()) else int(text)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def safe_float(value, default=0.0):
+    """Parse a float, returning *default* for blank or malformed input."""
+    try:
+        text = str(value).strip()
+        return float(text) if text else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def is_usable_mac(mac):
+    """Return True for a unicast, non-empty hardware address."""
+    if not mac:
+        return False
+    lowered = mac.strip().lower()
+    if lowered in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+        return False
+    try:
+        return not (int(lowered.split(":")[0], 16) & 1)
+    except (ValueError, IndexError):
+        return False
+
+
+def new_device(mac):
+    return {
+        "mac": mac,
+        "ips": set(),
+        "protocols": set(),
+        "bytes_sent": 0,
+        "bytes_received": 0,
+        "packets_sent": 0,
+        "packets_received": 0,
+        "hostname": "",
+        "device_type": "Unknown",
+        "hints": [],
+    }
 
 
 def print_usage():
@@ -57,6 +131,11 @@ OPTIONS:
     -v, --verbose          Enable verbose output with per-packet details.
 
     -q, --quiet            Suppress console output. Only write JSON report.
+
+    --keep-pcap            Keep the temporary .pcapng capture file. By default
+                           the capture is created with owner-only permissions
+                           in the system temp directory and deleted after
+                           analysis, so packet data is not left behind.
 
     -h, --help             Show this help message and exit.
 
@@ -157,12 +236,18 @@ def find_active_interface(interfaces):
 
 def capture_traffic(interface, duration=15, bpf_filter=None):
     """
-    Capture traffic using tshark and return raw pcapng bytes.
+    Capture traffic using tshark and return the pcap path plus parsed packets.
     Fields extracted per packet:
       frame.time_epoch, eth.src, eth.dst, ip.src, ip.dst,
       frame.protocols, frame.len, _ws.col.Protocol
+
+    The capture file is created in the system temp directory with a random
+    name and owner-only permissions. Callers are responsible for deleting it
+    unless the operator explicitly asked to keep it.
     """
-    pcap_file = f"flash_capture_{int(time.time())}.pcapng"
+    fd, pcap_file = tempfile.mkstemp(prefix="flashnet_capture_", suffix=".pcapng")
+    os.close(fd)
+    secure_file(pcap_file)
 
     fields = [
         "frame.time_epoch",
@@ -198,54 +283,54 @@ def capture_traffic(interface, duration=15, bpf_filter=None):
         cmd.append(bpf_filter)
 
     print(f"\n[CAPTURE] Capturing {duration}s on interface {interface['name']} ({interface['description']})...")
-    print(f"        Saved to: {pcap_file}")
+    print(f"        Temporary capture: {pcap_file}")
 
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stdout, stderr = process.communicate()
 
+    if process.returncode != 0 and stderr.strip():
+        print(f"[WARN] tshark exited {process.returncode}: {stderr.strip()[:200]}")
+
     packets = []
-    for line in stdout.strip().split("\n"):
+    truncated = False
+    for line in stdout.splitlines():
         if not line.strip():
             continue
+        if len(packets) >= MAX_CAPTURE_PACKETS:
+            truncated = True
+            break
         parts = line.split("|")
         pkt = {fields[i]: parts[i] if i < len(parts) else "" for i in range(len(fields))}
         packets.append(pkt)
+
+    if truncated:
+        print(f"[WARN] Capture exceeded {MAX_CAPTURE_PACKETS} packets; "
+              f"analysis truncated to the first {MAX_CAPTURE_PACKETS}.")
 
     return pcap_file, packets
 
 
 def analyze_packets(packets):
     """Analyze captured packets and produce structured network info."""
-    devices = defaultdict(lambda: {
-        "mac": "",
-        "ips": set(),
-        "protocols": set(),
-        "bytes_sent": 0,
-        "bytes_received": 0,
-        "packets_sent": 0,
-        "packets_received": 0,
-        "hostname": "",
-        "device_type": "Unknown",
-        "hints": [],
-    })
-
-    total_bytes = 0
+    devices = {}
     protocol_counts = defaultdict(int)
     timeline = []
+    total_bytes = 0
+    timeline_stride = max(1, len(packets) // MAX_TIMELINE_POINTS)
 
-    for pkt in packets:
-        src_mac = pkt.get("eth.src", "").strip()
-        dst_mac = pkt.get("eth.dst", "").strip()
-        src_ip = pkt.get("ip.src", "").strip()
-        dst_ip = pkt.get("ip.dst", "").strip()
-        frame_len = int(pkt.get("frame.len", "0"))
-        protocols = pkt.get("frame.protocols", "").strip()
-        col_proto = pkt.get("_ws.col.Protocol", "").strip()
-        hostname = pkt.get("dhcp.options.hostname", "").strip()
-        http_host = pkt.get("http.host", "").strip()
-        user_agent = pkt.get("http.user_agent", "").strip()
-        mdns_name = pkt.get("mdns.host_name", "").strip()
-        epoch = pkt.get("frame.time_epoch", "").strip()
+    for index, pkt in enumerate(packets):
+        src_mac = (pkt.get("eth.src") or "").strip()
+        dst_mac = (pkt.get("eth.dst") or "").strip()
+        src_ip = (pkt.get("ip.src") or "").strip()
+        dst_ip = (pkt.get("ip.dst") or "").strip()
+        frame_len = safe_int(pkt.get("frame.len"), 0)
+        protocols = (pkt.get("frame.protocols") or "").strip()
+        col_proto = (pkt.get("_ws.col.Protocol") or "").strip()
+        hostname = (pkt.get("dhcp.options.hostname") or "").strip()
+        http_host = (pkt.get("http.host") or "").strip()
+        user_agent = (pkt.get("http.user_agent") or "").strip()
+        mdns_name = (pkt.get("mdns.host_name") or "").strip()
+        epoch = safe_float(pkt.get("frame.time_epoch"), 0.0)
 
         if not src_mac and not src_ip:
             continue
@@ -256,57 +341,64 @@ def analyze_packets(packets):
         if col_proto:
             protocol_counts[col_proto] += 1
 
-        # Timeline
-        if epoch:
-            timeline.append({"time": float(epoch), "len": frame_len, "proto": col_proto})
+        # Timeline is sampled so a long capture cannot grow without bound.
+        if epoch > 0 and index % timeline_stride == 0:
+            timeline.append({"time": epoch, "len": frame_len, "proto": col_proto})
 
         # Device tracking by MAC
         for mac, ip, direction in [
             (src_mac, src_ip, "sent"),
             (dst_mac, dst_ip, "received"),
         ]:
-            if not mac or mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", "01:00:5e:00:00:00"):
+            if not is_usable_mac(mac):
                 continue
-
+            if mac not in devices:
+                devices[mac] = new_device(mac)
             dev = devices[mac]
-            dev["mac"] = mac
             if ip:
                 dev["ips"].add(ip)
             dev[f"bytes_{direction}"] += frame_len
             dev[f"packets_{direction}"] += 1
 
             # Collect protocol hints
-            proto_parts = protocols.split(":")
-            for p in proto_parts:
+            for p in protocols.split(":"):
                 p = p.strip()
                 if p and p not in ("eth", "ethertype", "ip", "ipv6", "frame"):
                     dev["protocols"].add(p)
 
-        # Hostname / device type hints
-        if hostname and not devices[src_mac]["hostname"]:
-            devices[src_mac]["hostname"] = hostname
-        if mdns_name and not devices[src_mac]["hostname"]:
-            devices[src_mac]["hostname"] = mdns_name
+        # Hostname / device type hints are only attributed to a real source
+        # MAC. Previously an empty eth.src created a phantom device.
+        if not is_usable_mac(src_mac) or src_mac not in devices:
+            continue
+
+        dev = devices[src_mac]
+        if hostname and not dev["hostname"]:
+            dev["hostname"] = hostname
+        if mdns_name and not dev["hostname"]:
+            dev["hostname"] = mdns_name
 
         if user_agent:
-            devices[src_mac]["hints"].append(f"UA: {user_agent}")
-            if "windows" in user_agent.lower():
-                devices[src_mac]["device_type"] = "Windows PC"
-            elif "linux" in user_agent.lower():
-                devices[src_mac]["device_type"] = "Linux"
-            elif "macintosh" in user_agent.lower() or "darwin" in user_agent.lower():
-                devices[src_mac]["device_type"] = "macOS"
-            elif "android" in user_agent.lower():
-                devices[src_mac]["device_type"] = "Android"
-            elif "iphone" in user_agent.lower() or "ipad" in user_agent.lower():
-                devices[src_mac]["device_type"] = "iOS"
+            dev["hints"].append(f"UA: {user_agent}")
+            ua_lower = user_agent.lower()
+            # Check mobile platforms before desktop ones: Android UAs contain
+            # "Linux" and iOS UAs contain "Macintosh".
+            if "android" in ua_lower:
+                dev["device_type"] = "Android"
+            elif "iphone" in ua_lower or "ipad" in ua_lower:
+                dev["device_type"] = "iOS"
+            elif "windows" in ua_lower:
+                dev["device_type"] = "Windows PC"
+            elif "macintosh" in ua_lower or "darwin" in ua_lower:
+                dev["device_type"] = "macOS"
+            elif "linux" in ua_lower:
+                dev["device_type"] = "Linux"
 
         if http_host:
-            devices[src_mac]["hints"].append(f"HTTP Host: {http_host}")
+            dev["hints"].append(f"HTTP Host: {http_host}")
 
     # Infer device type from MAC OUI patterns if still Unknown
     for mac, dev in devices.items():
-        if dev["device_type"] == "Unknown":
+        if dev["device_type"] == "Unknown" and is_usable_mac(mac):
             oui = mac[:8].upper()
             if oui in ("00:1A:", "00:1B:", "00:22:", "AC:DE:"):
                 dev["device_type"] = "Router / Network Device"
@@ -316,7 +408,7 @@ def analyze_packets(packets):
     return devices, total_bytes, protocol_counts, timeline
 
 
-def calculate_throughput(timeline, window_sec=1.0):
+def calculate_throughput(timeline, window_sec=1.0, total_bytes=None, total_packets=None):
     """Calculate throughput in bytes/sec over time windows."""
     if not timeline:
         return {"avg_bps": 0, "peak_bps": 0, "total_bytes": 0, "duration_sec": 0}
@@ -326,7 +418,8 @@ def calculate_throughput(timeline, window_sec=1.0):
     end = timeline[-1]["time"]
     duration = max(end - start, 0.001)
 
-    total_bytes = sum(p["len"] for p in timeline)
+    if total_bytes is None:
+        total_bytes = sum(p["len"] for p in timeline)
     avg_bps = (total_bytes * 8) / duration
 
     # Peak throughput in windows
@@ -345,7 +438,8 @@ def calculate_throughput(timeline, window_sec=1.0):
         "peak_mbps": round(peak_bps / 1_000_000, 4),
         "total_bytes": total_bytes,
         "duration_sec": round(duration, 2),
-        "total_packets": len(timeline),
+        "total_packets": total_packets if total_packets is not None else len(timeline),
+        "timeline_sampled": total_packets is not None and total_packets > len(timeline),
     }
 
 
@@ -375,7 +469,7 @@ def generate_report(devices, throughput, protocol_counts, interface, duration, c
             "interface": interface["name"],
             "interface_description": interface["description"],
             "capture_duration_sec": duration,
-            "capture_file": capture_file,
+            "capture_file": capture_file or "(not retained)",
         },
         "throughput": throughput,
         "protocol_distribution": dict(sorted(protocol_counts.items(), key=lambda x: x[1], reverse=True)),
@@ -384,11 +478,12 @@ def generate_report(devices, throughput, protocol_counts, interface, duration, c
     }
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs(output_dir, exist_ok=True)
+    secure_output_dir(output_dir)
 
     json_path = os.path.join(output_dir, f"network_scan_{timestamp}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+    secure_file(json_path)
 
     return report, json_path
 
@@ -438,6 +533,17 @@ def print_summary(report):
     print("=" * 60 + "\n")
 
 
+def parse_positive_int(value, option, minimum=1, maximum=86400):
+    """Parse a CLI integer with a clear error instead of a traceback."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        sys.exit(f"[ERROR] {option} expects an integer, got: {value!r}")
+    if number < minimum or number > maximum:
+        sys.exit(f"[ERROR] {option} must be between {minimum} and {maximum}, got: {number}")
+    return number
+
+
 def main():
     duration = 15
     iface_index = None
@@ -445,23 +551,25 @@ def main():
     bpf_filter = None
     verbose = False
     quiet = False
+    keep_pcap = False
 
     args = sys.argv[1:]
     i = 0
     while i < len(args):
-        if args[i] in ("-d", "--duration") and i + 1 < len(args):
-            duration = int(args[i + 1])
+        arg = args[i]
+        if arg in ("-d", "--duration") and i + 1 < len(args):
+            duration = parse_positive_int(args[i + 1], arg, minimum=1, maximum=3600)
             i += 2
-        elif args[i] in ("-i", "--interface") and i + 1 < len(args):
-            iface_index = int(args[i + 1])
+        elif arg in ("-i", "--interface") and i + 1 < len(args):
+            iface_index = parse_positive_int(args[i + 1], arg, minimum=0, maximum=100000)
             i += 2
-        elif args[i] in ("-o", "--output") and i + 1 < len(args):
+        elif arg in ("-o", "--output") and i + 1 < len(args):
             output_dir = args[i + 1]
             i += 2
-        elif args[i] in ("-f", "--filter") and i + 1 < len(args):
+        elif arg in ("-f", "--filter") and i + 1 < len(args):
             bpf_filter = args[i + 1]
             i += 2
-        elif args[i] == "--list-interfaces":
+        elif arg == "--list-interfaces":
             if not check_tshark():
                 sys.exit(1)
             interfaces = get_interfaces()
@@ -472,21 +580,24 @@ def main():
             for iface in interfaces:
                 print(f"  [{iface['index']}] {iface['name']} — {iface['description']}")
             sys.exit(0)
-        elif args[i] == "--protocols":
+        elif arg == "--protocols":
             print("Supported protocols: arp, bootp, dns, mdns, ssdp, http, tcp, udp,")
             print("  icmp, dhcp, llmnr, nbns, igmp, ospf, bgp, ssh, tls")
             sys.exit(0)
-        elif args[i] in ("-v", "--verbose"):
+        elif arg in ("-v", "--verbose"):
             verbose = True
             i += 1
-        elif args[i] in ("-q", "--quiet"):
+        elif arg in ("-q", "--quiet"):
             quiet = True
             i += 1
-        elif args[i] in ("-h", "--help"):
+        elif arg == "--keep-pcap":
+            keep_pcap = True
+            i += 1
+        elif arg in ("-h", "--help"):
             print_usage()
             sys.exit(0)
         else:
-            i += 1
+            sys.exit(f"[ERROR] Unknown option: {arg}\n        Use --help for usage.")
 
     if not quiet:
         print("=" * 60)
@@ -508,6 +619,8 @@ def main():
 
     if iface_index is not None:
         selected = next((iface for iface in interfaces if iface["index"] == iface_index), None)
+        if selected is None:
+            sys.exit(f"[ERROR] Interface index {iface_index} not found. Use --list-interfaces.")
     else:
         selected = find_active_interface(interfaces)
 
@@ -519,25 +632,34 @@ def main():
         print(f"\n  Selected: [{selected['index']}] {selected['description']}")
 
     capture_file, packets = capture_traffic(selected, duration, bpf_filter)
+    try:
+        if not packets:
+            print("[WARN] No packets captured. Try running as Administrator/root or check interface.")
+            sys.exit(0)
 
-    if not packets:
-        print("[WARN] No packets captured. Try running as Administrator/root or check interface.")
-        sys.exit(0)
+        if not quiet:
+            print(f"\n[ANALYSIS] Processing {len(packets)} packets...")
+        devices, total_bytes, protocol_counts, timeline = analyze_packets(packets)
+        throughput = calculate_throughput(
+            timeline, total_bytes=total_bytes, total_packets=len(packets)
+        )
 
-    if not quiet:
-        print(f"\n[ANALYSIS] Processing {len(packets)} packets...")
-    devices, total_bytes, protocol_counts, timeline = analyze_packets(packets)
-    throughput = calculate_throughput(timeline)
+        retained_file = capture_file if keep_pcap else None
+        report, output_path = generate_report(
+            devices, throughput, protocol_counts, selected, duration, retained_file, output_dir
+        )
+        report["_output_path"] = output_path
 
-    report, output_path = generate_report(
-        devices, throughput, protocol_counts, selected, duration, capture_file, output_dir
-    )
-    report["_output_path"] = output_path
-
-    if not quiet:
-        print_summary(report)
-    else:
-        print(f"Report saved to: {output_path}")
+        if not quiet:
+            print_summary(report)
+        else:
+            print(f"Report saved to: {output_path}")
+    finally:
+        if capture_file and not keep_pcap:
+            try:
+                os.remove(capture_file)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

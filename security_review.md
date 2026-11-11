@@ -3,8 +3,9 @@
 **Scope:** all files in this repository (`device_scanner`, `device_enumerator`,
 `network_scanner`, `network_diagram`, in both Python and PowerShell).
 **Date:** 2026-11-10
-**Status:** findings 1–4, 9 and 11 are fixed in this change. The remaining
-items are tracked below as follow-up work.
+**Status:** audit findings 1–4, 9, 11, 13–16, 20 and 21 are fixed, and the
+four "What I'd tackle next" items are complete. A small set of lower-priority
+follow-ups remains (section 2).
 
 This document is an operator-facing summary. It intentionally avoids
 publishing working exploit payloads.
@@ -98,32 +99,66 @@ reliably.
 
 ---
 
-## 2. Follow-up work (not fixed here)
+## 2. Second wave (fixed in this change)
 
-These are real issues from the audit that are intentionally out of scope for
-this change.
+The four "What I'd tackle next" items are complete, together with the
+additional findings from the same review.
 
-| Severity | Finding |
-|----------|---------|
-| High | Packet captures (`flash_capture_*.pcapng`) are written to the current directory, have predictable names, and are never deleted; they contain DHCP hostnames, HTTP hosts, and User-Agents. |
-| High | `network_scanner` has no `.gitignore` protection for `output/`, captures, or temp files; generated inventories can be committed accidentally. |
-| High | `Start-Process -ArgumentList` joins arguments with spaces without quoting, so paths/commands containing spaces or quotes can break or shift arguments. |
-| High | The PowerShell `-Timeout` parameters are accepted but not applied to `Start-Process -Wait`; a stalled SSH session blocks the scan indefinitely. |
-| High | The Python ping sweep starts one process per host before waiting; a large CIDR can exhaust the process table. |
-| Medium | Windows registry parsing in `device_enumerator.py` flushes each app on the `DisplayName` line, so version/publisher/install-location are always empty. |
-| Medium | `get_local_network_range()` on Windows passes an empty argument to `ipconfig` and looks for CIDR text that `ipconfig` never prints, so it always falls back to `192.168.1.0/24`. |
-| Medium | Unguarded `int()`/`float()` conversions on CLI arguments and tshark fields crash on malformed input. |
-| Medium | `network_scanner.ps1` excludes interfaces whose name matches `NPF_`, which is every real tshark adapter; it also dereferences `$devices[$srcMac]` without a key check. |
-| Medium | `device_enumerator.py` runs `head` in the Windows command suite, where it does not exist. |
-| Medium | Several package parsers (snap, winget, choco) split on `|` even though those tools emit column/whitespace output, so results are silently empty. |
-| Medium | `device_scanner.py` treats an empty enumerated hostname as present, so the discovered hostname fallback never applies. |
-| Low | Markdown tables in the diagram builders do not escape `|` or newlines from hostnames/OS strings. |
-| Low | `device_enumerator.ps1` requires Administrator even though it only invokes plink. |
-| Low | `scan_index.json` is overwritten on every run, losing history. |
+| # | Finding | Fix |
+|---|---------|-----|
+| 13 | Packet captures were written to the current directory with predictable names and never deleted | `python`: temp directory, `mkstemp` name, `0600`, deleted unless `--keep-pcap`; PowerShell: GUID-named temp file, owner-only ACL, deleted unless `-KeepPcap`. Analysis is capped at 200,000 packets and the timeline is sampled to 20,000 points to bound memory. |
+| 14 | No `.gitignore` protection for generated inventories, captures, temp files, or secrets | Repo-root `.gitignore` covers `output/`, `*.pcapng`/`*.pcap`, capture/temp names, password files, and Python caches. |
+| 15 | `Start-Process -ArgumentList` joined arguments without quoting | `ConvertTo-ProcessArgument` / `Join-ProcessArguments` implement the Windows `CommandLineToArgvW` quoting rules (spaces, quotes, trailing backslashes) in every PowerShell tool. |
+| 16 | `-Timeout` was accepted but not enforced around `Start-Process -Wait` | `Invoke-ProcessWithTimeout` waits with a real deadline, kills the child on expiry, and reports the timeout to the caller. |
+| 20 | Windows registry parser flushed each app on the `DisplayName` line, losing version/publisher/location | The parser now accumulates fields until the next `DisplayName` or blank line; `REG_SZ`/`REG_EXPAND_SZ` values with empty data are preserved as empty strings. |
+| 21 | Auto-range passed an empty argument to `ipconfig` and always fell back to `192.168.1.0/24` | Windows parsing pairs each `IPv4 Address` with its following `Subnet Mask` and derives the network base; POSIX uses `ip -4 addr`. Both return `None`/`$null` and fail loudly instead of guessing a range. |
+
+Additional hardening delivered alongside those items:
+
+- **Phantom devices eliminated.** Device hints are only applied when the source
+  MAC already exists in the map, in Python and PowerShell. Empty or
+  destination-only MACs can no longer create a device.
+- **PowerShell adapter filter corrected.** Only loopback/pseudo interfaces are
+  skipped; real `\Device\NPF_{GUID}` adapters are selectable.
+- **Ping sweeps bounded.** Python uses a `ThreadPoolExecutor` of 64 workers;
+  PowerShell sends asynchronous batches of 64. Both reject sweeps larger than
+  65,536 hosts.
+- **Numeric parsing hardened.** CLI integers use `parse_int_arg` /
+  `parse_positive_int`; packet fields use `safe_int` / `safe_float` and
+  `[int]::TryParse` / `[double]::TryParse`. Malformed values no longer crash a
+  scan.
+- **CLI validation.** Invalid modes and unknown options are rejected with a
+  message on both the Python and PowerShell paths; `--mode tshark` requires an
+  interface.
+- **Diagram output escaped.** Hostnames, OS strings, and inventory values have
+  `|`, newlines, raw HTML, and backticks escaped before entering Markdown
+  tables. These edits are present in `network_diagram.py` / `network_diagram.ps1`
+  in the working tree but are intentionally left out of this commit because
+  those files also contain unrelated uncommitted user work.
+- **StrictMode enabled.** All four PowerShell tools run with
+  `Set-StrictMode -Version Latest`, surfacing undefined variables and properties
+  during development rather than at an operator's console.
+- **Generate files are private.** Output directories are created owner-only and
+  reports get owner-only permissions (`chmod` on POSIX, ACL replacement on
+  Windows).
+- **Windows `head` usage removed** from the enumerator command suite.
 
 ---
 
-## 3. Operator guidance
+## 3. Follow-up work (not fixed here)
+
+These lower-priority issues remain outside the current change.
+
+| Severity | Finding |
+|----------|---------|
+| Medium | Some application parsers still assume `|`-separated output. Debian/RPM and winget paths are handled, but `snap list`, `pacman -Qi`, and chocolatey output are not normalized, so those inventories can be empty or partial. |
+| Low | `device_enumerator.ps1` still declares `#Requires -RunAsAdministrator`, although it only invokes plink. |
+| Low | `scan_index.json` is still overwritten on every run, so scan history is lost. |
+| Low | Auto-range picks the first usable IPv4 adapter and may select a VPN or virtual adapter when several are active. Pass an explicit range for deterministic results. |
+
+---
+
+## 4. Operator guidance
 
 1. **Prefer keys over passwords.** Use `-k`/`-Key` with a passphrase-protected
    key where possible.
@@ -132,16 +167,18 @@ this change.
 3. **Never put secrets in argv.** Put the password in a file readable only by
    the service account and use `-PasswordFile`/`--password-file`, or use
    `-AskPassword`/`--ask-password` interactively.
-4. **Protect output.** Reports contain a full software inventory. Restrict the
-   output directory ACL/umask and keep it out of version control.
-5. **Scope scans tightly.** Pass an explicit `-Range`/`--range`; do not rely on
-   auto-detection, which is still unreliable on Windows (see follow-up table).
+4. **Protect output.** Reports contain a full software inventory. The tools now
+   create output files owner-only, but keep the output directory out of version
+   control and review its ACL on shared systems.
+5. **Scope scans tightly.** Pass an explicit `-Range`/`--range`. Auto-detection
+   now fails loudly instead of guessing, but it still selects the first usable
+   adapter and may pick a VPN interface.
 
 ---
 
-## 4. Verification performed
+## 5. Verification performed
 
-- `python -m py_compile device_scanner.py device_enumerator.py`
+- `python -m py_compile network_scanner.py device_scanner.py device_enumerator.py network_diagram.py`
 - Direct unit checks of the sanitiser, output-path guard, password-file
   create/read/zero/delete cycle, and CIDR membership helpers.
 - `device_scanner.py -pw SecretPass` and `device_enumerator.py -pw SecretPass`
@@ -151,5 +188,17 @@ this change.
   errors for all four `.ps1` files under Windows PowerShell 5.1.
 - `ConvertTo-SafeFileName`, `Join-SafeOutputPath`, `Test-IPInRange`, and
   `New-PasswordFile`/`Remove-PasswordFile` were executed directly and produce
-  the expected results (traversal blocked, `CON` prefixed, /24 membership
-  enforced, password file removed and zeroed).
+  the expected results (traversal blocked, `CON` prefixed, CIDR membership
+  enforced for /24, /25, /31, and /32, password file removed and zeroed).
+- Phantom-device, Android User-Agent ordering, malformed packet numerics,
+  bounded ping, registry parsing, Windows auto-range, and Markdown escaping
+  probes pass.
+- PowerShell quoting was round-tripped through a child process with paths
+  containing spaces, embedded quotes, and trailing backslashes.
+- `ConvertTo-NetworkAddress` returns the expected bases (`192.168.1.0/24`,
+  `192.168.1.128/25`, `10.20.0.0/16`, `192.168.1.2/31`).
+- `-Help` and unknown-option handling were smoke-tested for all four
+  PowerShell scripts under `Set-StrictMode -Version Latest`; invalid modes,
+  durations, and unknown arguments exit non-zero with a clear message.
+- `Calculate-Throughput` handles a single timeline sample without dividing by
+  zero and reports true totals when the timeline is sampled.

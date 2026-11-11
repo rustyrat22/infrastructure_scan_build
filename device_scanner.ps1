@@ -87,6 +87,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Write-Header {
@@ -204,7 +205,7 @@ function Test-IPInRange {
         }
         $remaining = $prefix % 8
         if ($remaining -gt 0) {
-            $mask = [byte](0xFF -shl (8 - $remaining))
+            $mask = [byte]((0xFF -shl (8 - $remaining)) -band 0xFF)
             if (($netBytes[$fullBytes] -band $mask) -ne ($ipBytes[$fullBytes] -band $mask)) { return $false }
         }
         return $true
@@ -217,20 +218,42 @@ function New-PasswordFile {
         "flashnet_pw_" + [guid]::NewGuid().ToString("N") + ".txt")
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($path, $Password, $utf8)
+    Set-RestrictiveFileAcl -Path $path
+    return $path
+}
+
+function Set-RestrictiveFileAcl {
+    param([string]$Path)
     try {
         if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $path
+            $acl = Get-Acl -LiteralPath $Path
             $acl.SetAccessRuleProtection($true, $false)
             $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
                 [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
                 "FullControl", "Allow")
             $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $path -AclObject $acl
+            Set-Acl -LiteralPath $Path -AclObject $acl
         } else {
-            & chmod 600 $path 2>$null
+            & chmod 600 $Path 2>$null
         }
     } catch { }
-    return $path
+}
+
+function Set-RestrictiveDirectoryAcl {
+    param([string]$Path)
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "Allow")
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } else {
+            & chmod 700 $Path 2>$null
+        }
+    } catch { }
 }
 
 function Remove-PasswordFile {
@@ -243,6 +266,83 @@ function Remove-PasswordFile {
         }
     } catch { }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
+function ConvertTo-ProcessArgument {
+    # Quote one argument using the Windows CommandLineToArgvW rules that
+    # .NET/plink/tshark use. Start-Process joins ArgumentList with spaces and
+    # lets the child re-parse it, so every argument must be quoted explicitly.
+    param([string]$Value)
+    if ($null -eq $Value -or $Value -eq "") { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$builder.Append('\' * (($backslashes * 2) + 1))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append('\' * $backslashes)
+            $backslashes = 0
+        }
+        [void]$builder.Append($ch)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append('\' * ($backslashes * 2)) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+    $quoted = foreach ($arg in $Arguments) { ConvertTo-ProcessArgument -Value $arg }
+    return ($quoted -join ' ')
+}
+
+function Invoke-ProcessWithTimeout {
+    # Start a native process with correctly quoted arguments and enforce a real
+    # timeout. Start-Process -Wait ignores -Timeout entirely and can block
+    # forever on a stalled SSH session.
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds,
+        [string]$StdOutPath = "",
+        [string]$StdErrPath = ""
+    )
+
+    $startParams = @{
+        FilePath     = $FilePath
+        ArgumentList = (Join-ProcessArguments -Arguments $Arguments)
+        NoNewWindow  = $true
+        PassThru     = $true
+    }
+    if ($StdOutPath) { $startParams.RedirectStandardOutput = $StdOutPath }
+    if ($StdErrPath) { $startParams.RedirectStandardError = $StdErrPath }
+
+    $process = Start-Process @startParams
+    $timedOut = $false
+
+    try {
+        if ($TimeoutSeconds -le 0) {
+            $process.WaitForExit()
+        } elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $timedOut = $true
+            try { $process.Kill() } catch { }
+            try { [void]$process.WaitForExit(2000) } catch { }
+        }
+    } catch {
+        try { $process.Kill() } catch { }
+        throw
+    }
+
+    $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
+    return @{ Process = $process; TimedOut = $timedOut; ExitCode = $exitCode }
 }
 
 function Test-Tool {
@@ -259,52 +359,126 @@ function Test-Tool {
     return $false
 }
 
+function ConvertTo-NetworkAddress {
+    param([string]$Address, [int]$PrefixLength)
+    $ip = [System.Net.IPAddress]::Parse($Address)
+    if ($ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        throw "Only IPv4 ranges are supported."
+    }
+    $bytes = $ip.GetAddressBytes()
+    [Array]::Reverse($bytes)
+    $value = [uint64][BitConverter]::ToUInt32($bytes, 0)
+    $mask = [uint64]0
+    if ($PrefixLength -gt 0) {
+        $mask = ([uint64]4294967295 -shl (32 - $PrefixLength)) -band [uint64]4294967295
+    }
+    $network = $value -band $mask
+    $netBytes = [BitConverter]::GetBytes([uint32]$network)
+    [Array]::Reverse($netBytes)
+    return [System.Net.IPAddress]::new($netBytes).IPAddressToString
+}
+
 function Get-LocalNetworkRange {
     try {
         $adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notmatch "^127\." -and $_.PrefixLength -le 24 -and $_.PrefixLength -gt 0 }
+            Where-Object { $_.IPAddress -notmatch "^127\." -and $_.PrefixLength -le 30 -and $_.PrefixLength -ge 8 }
         if ($adapters) {
-            $a = $adapters | Select-Object -First 1
-            $network = [System.Net.IPAddress]::Parse($a.IPAddress)
-            return "$($a.IPAddress)/$($a.PrefixLength)"
+            $a = $adapters | Where-Object { $_.PrefixOrigin -ne "WellKnown" } | Select-Object -First 1
+            if (-not $a) { $a = $adapters | Select-Object -First 1 }
+            $network = ConvertTo-NetworkAddress -Address $a.IPAddress -PrefixLength ([int]$a.PrefixLength)
+            return "$network/$($a.PrefixLength)"
         }
     } catch {}
-    return "192.168.1.0/24"
+    return $null
+}
+
+function Complete-PingBatch {
+    param([array]$Batch)
+    $alive = @()
+    if (-not $Batch -or $Batch.Count -eq 0) { return $alive }
+    $tasks = [System.Threading.Tasks.Task[]]@($Batch | ForEach-Object { $_.Task })
+    try { [void][System.Threading.Tasks.Task]::WaitAll($tasks, 60000) } catch { }
+    foreach ($item in $Batch) {
+        try {
+            if ($item.Task.IsCompleted -and -not $item.Task.IsFaulted -and
+                $item.Task.Result.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $alive += $item.IP
+            }
+        } catch { }
+        try { $item.Ping.Dispose() } catch { }
+    }
+    return $alive
 }
 
 function Discover-Ping {
     param([string]$NetworkRange, [int]$MaxDevices, [int]$PingTimeout, [bool]$Verbose)
 
     try {
-        $net = [System.Net.IPAddress]::Parse($NetworkRange.Split("/")[0])
-        $prefix = [int]$NetworkRange.Split("/")[1]
-        $ipBytes = $net.GetAddressBytes()
-        [Array]::Reverse($ipBytes)
-        $ipInt = [BitConverter]::ToUInt32($ipBytes, 0)
+        $parts = $NetworkRange.Split("/")
+        if ($parts.Count -ne 2) { throw "CIDR expected" }
+        $ip = [System.Net.IPAddress]::Parse($parts[0])
+        if ($ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "IPv4 only" }
+        $prefix = [int]$parts[1]
+        if ($prefix -lt 0 -or $prefix -gt 32) { throw "bad prefix" }
+
+        $bytes = $ip.GetAddressBytes()
+        [Array]::Reverse($bytes)
+        $baseValue = [uint64][BitConverter]::ToUInt32($bytes, 0)
         $hostBits = 32 - $prefix
-        $totalHosts = [Math]::Min([Math]::Pow(2, $hostBits) - 2, 254)
+        $total = [uint64][Math]::Pow(2, $hostBits)
+        $mask = [uint64]0
+        if ($prefix -gt 0) {
+            $mask = ([uint64]4294967295 -shl $hostBits) -band [uint64]4294967295
+        }
+        $network = $baseValue -band $mask
+        if ($total -gt 2) {
+            $first = $network + 1
+            $last = $network + $total - 2
+        } else {
+            $first = $network
+            $last = $network + $total - 1
+        }
     } catch {
+        Write-Host "[ERROR] Invalid network range: $NetworkRange" -ForegroundColor Red
         return @()
     }
 
-    $devices = @()
-    $count = 0
-    for ($i = 1; $i -le $totalHosts; $i++) {
-        if ($MaxDevices -gt 0 -and $count -ge $MaxDevices) { break }
-        $hostInt = $ipInt -bor $i
-        $hostBytes = [BitConverter]::GetBytes($hostInt)
-        [Array]::Reverse($hostBytes)
-        $hostIP = [System.Net.IPAddress]::new($hostBytes).IPAddressToString
+    $hostCount = $last - $first + 1
+    if ($hostCount -gt 65536) {
+        Write-Host "[ERROR] Range $NetworkRange contains $hostCount addresses; narrow it (max 65536)." -ForegroundColor Red
+        return @()
+    }
 
-        try {
-            $ping = New-Object System.Net.NetworkInformation.Ping
-            $reply = $ping.Send($hostIP, $PingTimeout * 1000)
-            if ($reply.Status -eq "Success") {
-                $devices += @{ ip = $hostIP; mac = "N/A"; hostname = $hostIP; method = "ping" }
-                $count++
-                if ($Verbose) { Write-Host "  [+] $hostIP is alive" -ForegroundColor Green }
+    if ($Verbose) { Write-Host "[PING] Sweeping $hostCount hosts in $NetworkRange..." }
+
+    $devices = @()
+    $batch = @()
+    $batchSize = 64
+    for ($addr = $first; $addr -le $last; $addr++) {
+        if ($MaxDevices -gt 0 -and $devices.Count -ge $MaxDevices) { break }
+        $addrBytes = [BitConverter]::GetBytes([uint32]$addr)
+        [Array]::Reverse($addrBytes)
+        $hostIP = [System.Net.IPAddress]::new($addrBytes).IPAddressToString
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $task = $ping.SendPingAsync($hostIP, $PingTimeout * 1000)
+        $batch += @{ IP = $hostIP; Ping = $ping; Task = $task }
+        if ($batch.Count -ge $batchSize) {
+            foreach ($alive in (Complete-PingBatch -Batch $batch)) {
+                $devices += @{ ip = $alive; mac = "N/A"; hostname = $alive; method = "ping" }
+                if ($Verbose) { Write-Host "  [+] $alive is alive" -ForegroundColor Green }
             }
-        } catch {}
+            $batch = @()
+        }
+    }
+    if ($batch.Count -gt 0) {
+        foreach ($alive in (Complete-PingBatch -Batch $batch)) {
+            $devices += @{ ip = $alive; mac = "N/A"; hostname = $alive; method = "ping" }
+            if ($Verbose) { Write-Host "  [+] $alive is alive" -ForegroundColor Green }
+        }
+    }
+
+    if ($MaxDevices -gt 0 -and $devices.Count -gt $MaxDevices) {
+        $devices = @($devices | Select-Object -First $MaxDevices)
     }
     return $devices
 }
@@ -344,15 +518,20 @@ function Discover-Tshark {
         if ($InterfaceIdx -ge 0) { $cmdArgs = @("-i", $InterfaceIdx.ToString()) + $cmdArgs }
 
         $tmpFile = [System.IO.Path]::GetTempFileName()
-        $process = Start-Process -FilePath "tshark" -ArgumentList $cmdArgs `
-            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpFile
-        $lines = Get-Content $tmpFile -Encoding UTF8
-        Remove-Item $tmpFile -Force
+        try {
+            $run = Invoke-ProcessWithTimeout -FilePath "tshark" -Arguments $cmdArgs `
+                -TimeoutSeconds 60 -StdOutPath $tmpFile
+            if ($run.TimedOut -and $Verbose) { Write-Host "[WARN] tshark discovery timed out" -ForegroundColor Yellow }
+            $lines = Get-Content -LiteralPath $tmpFile -Encoding UTF8
+        } finally {
+            Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
+        }
 
         foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
             $parts = $line -split "\|"
             foreach ($ipField in @(0, 1)) {
+                if ($ipField -ge $parts.Count) { continue }
                 $ip = $parts[$ipField].Trim()
                 $mac = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
                 if ($ip -and $ip -notmatch "^(127\.|224\.|239\.|255\.)" -and -not $seenIps.ContainsKey($ip) `
@@ -380,14 +559,14 @@ function Discover-Devices {
     $allDevices = @{}
 
     if ($Mode -in @("ping", "all")) {
-        foreach ($dev in (Discover-Ping -NetworkRange $NetworkRange -MaxDevices $MaxDevices `
+        foreach ($dev in @(Discover-Ping -NetworkRange $NetworkRange -MaxDevices $MaxDevices `
                                           -PingTimeout $PingTimeout -Verbose $Verbose)) {
             $allDevices[$dev.ip] = $dev
         }
     }
 
     if ($Mode -in @("arp", "all")) {
-        foreach ($dev in (Discover-Arp -NetworkRange $NetworkRange -Verbose $Verbose)) {
+        foreach ($dev in @(Discover-Arp -NetworkRange $NetworkRange -Verbose $Verbose)) {
             if (-not $allDevices.ContainsKey($dev.ip)) {
                 $allDevices[$dev.ip] = $dev
             }
@@ -395,7 +574,7 @@ function Discover-Devices {
     }
 
     if ($Mode -in @("tshark", "all") -and $Interface -ge 0) {
-        foreach ($dev in (Discover-Tshark -InterfaceIdx $Interface -NetworkRange $NetworkRange -Verbose $Verbose)) {
+        foreach ($dev in @(Discover-Tshark -InterfaceIdx $Interface -NetworkRange $NetworkRange -Verbose $Verbose)) {
             if (-not $allDevices.ContainsKey($dev.ip)) {
                 $allDevices[$dev.ip] = $dev
             }
@@ -404,7 +583,7 @@ function Discover-Devices {
 
     $devices = @($allDevices.Values)
     if ($MaxDevices -gt 0 -and $devices.Count -gt $MaxDevices) {
-        $devices = $devices | Select-Object -First $MaxDevices
+        $devices = @($devices | Select-Object -First $MaxDevices)
     }
     return $devices
 }
@@ -424,15 +603,19 @@ function Invoke-Plink {
     $tmpOut = [System.IO.Path]::GetTempFileName()
     $tmpErr = [System.IO.Path]::GetTempFileName()
 
-    $process = Start-Process -FilePath "plink" -ArgumentList $cmdArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+    $run = Invoke-ProcessWithTimeout -FilePath "plink" -Arguments $cmdArgs `
+        -TimeoutSeconds $Timeout -StdOutPath $tmpOut -StdErrPath $tmpErr
 
     $stdout = ""; $stderr = ""
-    if (Test-Path $tmpOut) { $stdout = Get-Content $tmpOut -Raw -Encoding UTF8; Remove-Item $tmpOut -Force }
-    if (Test-Path $tmpErr) { $stderr = Get-Content $tmpErr -Raw -Encoding UTF8; Remove-Item $tmpErr -Force }
+    if (Test-Path -LiteralPath $tmpOut) { $stdout = Get-Content -LiteralPath $tmpOut -Raw -Encoding UTF8; Remove-Item -LiteralPath $tmpOut -Force }
+    if (Test-Path -LiteralPath $tmpErr) { $stderr = Get-Content -LiteralPath $tmpErr -Raw -Encoding UTF8; Remove-Item -LiteralPath $tmpErr -Force }
 
-    return @{ stdout = $stdout; stderr = $stderr; exitcode = $process.ExitCode }
+    if ($run.TimedOut) {
+        if ($stderr) { $stderr += "`n" }
+        $stderr += "Command timed out after ${Timeout}s"
+    }
+
+    return @{ stdout = $stdout; stderr = $stderr; exitcode = $run.ExitCode }
 }
 
 function Detect-Os {
@@ -668,7 +851,7 @@ function Enumerate-Device {
     return @{
         hostname = ([string]$stdoutMap["hostname"]).Trim()
         os = $osText
-        architecture = $stdoutMap["architecture"].Trim()
+        architecture = ([string]$stdoutMap["architecture"]).Trim()
         applications = $unique
         scan_methods = $scanMethods
         os_detected = $osType
@@ -694,7 +877,7 @@ function Build-DeviceJson {
         }
         applications = @($EnumResult.applications)
         scan_summary = @{
-            total_applications = $EnumResult.applications.Count
+            total_applications = @($EnumResult.applications).Count
             scan_duration_seconds = $EnumResult.duration
             errors = $EnumResult.errors
         }
@@ -704,7 +887,10 @@ function Build-DeviceJson {
 function Save-DeviceJson {
     param([hashtable]$Report, [string]$OutputDir, [string]$Ip, [string]$Hostname)
 
-    if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+    if (!(Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir | Out-Null
+        Set-RestrictiveDirectoryAcl -Path $OutputDir
+    }
 
     $hostValue = if ([string]::IsNullOrWhiteSpace($Hostname)) { $Ip } else { $Hostname }
     $safeHostname = ConvertTo-SafeFileName -Value $hostValue -Fallback "unknown"
@@ -714,6 +900,7 @@ function Save-DeviceJson {
     $filepath = Join-SafeOutputPath -OutputDir $OutputDir -FileName $filename
 
     $Report | ConvertTo-Json -Depth 5 | Out-File -FilePath $filepath -Encoding UTF8
+    Set-RestrictiveFileAcl -Path $filepath
     return $filepath
 }
 
@@ -730,6 +917,16 @@ function Scan-AndPopulate {
         Write-Header "Flash_Network — Device Scanner & JSON Reporter (PowerShell)"
     }
 
+    $validModes = @("ping", "arp", "tshark", "all")
+    if ($Mode -notin $validModes) {
+        Write-Host "[ERROR] Invalid mode '$Mode'. Choose one of: $($validModes -join ', ')." -ForegroundColor Red
+        return @()
+    }
+    if ($Mode -eq "tshark" -and $Interface -lt 0) {
+        Write-Host "[ERROR] -Mode tshark requires -Interface <index>." -ForegroundColor Red
+        return @()
+    }
+
     # Check prerequisites
     if (-not (Test-Tool "plink")) {
         Write-Host "[FATAL] plink is required. Install PuTTY and add to PATH." -ForegroundColor Red
@@ -743,13 +940,17 @@ function Scan-AndPopulate {
 
     if (-not $NetworkRange) {
         $NetworkRange = Get-LocalNetworkRange
+        if (-not $NetworkRange) {
+            Write-Host "[ERROR] Could not auto-detect a usable IPv4 network. Pass -Range explicitly." -ForegroundColor Red
+            return @()
+        }
         if (-not $Quiet) { Write-Host "[AUTO] Detected network range: $NetworkRange" -ForegroundColor Cyan }
     }
 
     if (-not $Quiet) { Write-Host "`n[DISCOVERY] Scanning $NetworkRange (mode: $Mode)..." -ForegroundColor Magenta }
 
-    $devices = Discover-Devices -NetworkRange $NetworkRange -Mode $Mode -Interface $Interface `
-        -MaxDevices $MaxDevices -PingTimeout 2 -Verbose $Verbose
+    $devices = @(Discover-Devices -NetworkRange $NetworkRange -Mode $Mode -Interface $Interface `
+        -MaxDevices $MaxDevices -PingTimeout 2 -Verbose $Verbose)
 
     if ($devices.Count -eq 0) {
         Write-Host "[INFO] No devices discovered." -ForegroundColor Yellow
@@ -792,14 +993,17 @@ function Scan-AndPopulate {
     }
 
     $totalTime = ((Get-Date) - $startTime).TotalSeconds
-    $successful = ($results | Where-Object { $_.status -eq "success" }).Count
+    $successful = @($results | Where-Object { $_.status -eq "success" }).Count
     $totalApps = 0
     foreach ($result in $results) {
         if ($result.status -eq "success") { $totalApps += [int]$result.apps }
     }
 
     # Write index
-    if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+    if (!(Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir | Out-Null
+        Set-RestrictiveDirectoryAcl -Path $OutputDir
+    }
     $index = @{
         scan_timestamp = Get-Date -Format "o"
         network_range = $NetworkRange
@@ -812,6 +1016,7 @@ function Scan-AndPopulate {
     }
     $indexPath = Join-Path $OutputDir "scan_index.json"
     $index | ConvertTo-Json -Depth 4 | Out-File -FilePath $indexPath -Encoding UTF8
+    Set-RestrictiveFileAcl -Path $indexPath
 
     if (-not $Quiet) {
         Write-Header "SCAN COMPLETE"
@@ -829,6 +1034,11 @@ function Scan-AndPopulate {
 
 # Main
 if ($Help) { Write-Usage; exit 0 }
+
+if ($args.Count -gt 0) {
+    Write-Host "[ERROR] Unknown argument(s): $($args -join ' '). Use -Help for usage." -ForegroundColor Red
+    exit 1
+}
 
 if (-not $Quiet) {
     Write-Header "Flash_Network — Device Scanner & JSON Reporter"
