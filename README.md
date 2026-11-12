@@ -20,6 +20,7 @@ flowchart TD
         DE[Device Enumerator]
         AE[Application Extractor]
         JR[JSON Reporter]
+        NDB[Network Diagram Builder]
     end
 
     subgraph External_Tools
@@ -32,6 +33,7 @@ flowchart TD
     subgraph Output
         NETDISC[Network Discovery Data]
         DEVJSON[Device JSON Files]
+        MD[Mermaid Markdown Diagrams]
     end
 
     U --> CM
@@ -49,6 +51,11 @@ flowchart TD
     AE --> PY
     AE --> JR
     JR --> DEVJSON
+    NETDISC --> NDB
+    DEVJSON --> NDB
+    NDB --> PS
+    NDB --> PY
+    NDB --> MD
 ```
 
 ---
@@ -264,6 +271,71 @@ Each device gets its own file: `{hostname}_{ip_address}.json`
 
 ---
 
+## Network Diagram Builder
+
+`network_diagram.py` / `network_diagram.ps1` turn scan output into a single Markdown report with embedded [mermaid.js](https://mermaid.js.org) diagrams. They read the JSON files produced by the other modules (`network_scan_*.json`, `device_enum_*.json`, `{hostname}_{ip}_*.json`, `scan_index.json`) from the input directory and write `output/network_diagram_YYYYMMDD_HHMMSS.md`.
+
+### Generated diagrams
+
+- **Network topology** flowchart — Internet → gateway → local network → devices, grouped by device type (with IP, MAC, and traffic per node)
+- **Protocol distribution** pie chart — packets captured per protocol
+- **Device inventory** flowchart — enumerated devices grouped by detected OS, with application counts
+- **Scan results** pie chart — successes vs errors from `scan_index.json`
+- **Tables** — top talkers by traffic and the full enumerated-device inventory
+
+### Python usage
+
+```bash
+python network_diagram.py [options]
+```
+
+| Flag | Description |
+|---|---|
+| `-i, --input DIR` | Input directory with scan JSON files (default: `./output/`) |
+| `-o, --output DIR` | Output directory for the Markdown file (default: `./output/`) |
+| `-s, --scan FILE` | Use a specific `network_scan` JSON file |
+| `-t, --title TITLE` | Report title (default: `Flash_Network Network Diagram`) |
+| `-n, --max-devices NUM` | Max devices shown in diagrams (default: 40, 0 = unlimited) |
+| `-v, --verbose` | Verbose output |
+| `-q, --quiet` | Markdown only, no console output |
+| `-h, --help` | Show help |
+
+### PowerShell usage
+
+```powershell
+.\network_diagram.ps1 [options]
+```
+
+| Parameter | Description |
+|---|---|
+| `-InputDir DIR` | Input directory with scan JSON files (default: `./output/`) |
+| `-OutputDir DIR` | Output directory for the Markdown file (default: `./output/`) |
+| `-Scan FILE` | Use a specific `network_scan` JSON file |
+| `-Title TITLE` | Report title |
+| `-MaxDevices NUM` | Max devices shown in diagrams (default: 40, 0 = unlimited) |
+| `-Verbose` | Verbose output |
+| `-Quiet` | Markdown only, no console output |
+| `-Help` | Show help |
+
+### Example output
+
+```mermaid
+flowchart TD
+    INET["Internet"]
+    GW["Gateway / Router"]
+    INET --> GW
+    NET["Local Network"]
+    GW --> NET
+    subgraph G1["Workstation - 1 device(s)"]
+        G1D1["WORKSTATION-01<br/>192.168.1.50<br/>AC:DE:48:00:11:22<br/>4.0 MB traffic"]
+        NET --> G1D1
+    end
+```
+
+Render the generated report with any mermaid-aware viewer (GitHub, GitLab, VS Code Markdown preview, Obsidian).
+
+---
+
 ## Data Flow
 
 ```mermaid
@@ -302,12 +374,15 @@ Flash_Network/
 │   ├── device_enumerator.ps1     # PowerShell remoting
 │   ├── app_extractor.py          # Python application enumeration
 │   ├── app_extractor.ps1         # PowerShell application enumeration
-│   └── json_reporter.py          # JSON schema + file generation
+│   ├── json_reporter.py          # JSON schema + file generation
+│   ├── network_diagram.py        # Mermaid Markdown diagram builder
+│   └── network_diagram.ps1       # PowerShell diagram builder
 ├── output/
 │   └── scans/
 │       └── {date}/
 │           ├── {hostname}_{ip}.json   # One per device
-│           └── scan_index.json        # Master index of all scans
+│           ├── scan_index.json        # Master index of all scans
+│           └── network_diagram_YYYYMMDD_HHMMSS.md  # Mermaid diagram report
 ├── logs/
 │   └── flash_network.log
 ├── requirements.txt              # Python dependencies
@@ -413,3 +488,4 @@ sequenceDiagram
 7. **Scalable** — Threaded/async scanning for large networks
 8. **Resume Support** — Index tracks completed devices for interrupted scans
 9. **Logging** — Full audit trail in structured log files
+10. **Mermaid Diagrams** — Markdown network diagram reports rendered by mermaid.js (dual Python/PowerShell implementation)

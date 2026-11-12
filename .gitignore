@@ -19,3 +19,10 @@ flashnet_pw_*
 # Python bytecode / caches
 __pycache__/
 *.py[cod]
+
+# Environment Variables files
+.env
+*.key
+
+# Node 
+node_modules/
