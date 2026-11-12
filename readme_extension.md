@@ -1,4 +1,4 @@
-# Flash_Network — Device Scanner Extension
+# infrastructure_scan_build — Device Scanner Extension
 
 ## Overview
 
