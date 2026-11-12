@@ -8,39 +8,41 @@ Requirements:
   - Run as Administrator (Windows) or root (Linux) for packet capture
 """
 
-import subprocess
-import sys
 import json
 import os
 import re
-import tempfile
+import sys
 from datetime import datetime, timezone
 from collections import defaultdict
+
+from flashnet_common import (
+    create_secure_temp_file,
+    resolve_tool,
+    run_bounded,
+    sanitize_console_text,
+    secure_file,
+    secure_output_dir,
+)
 
 
 # Capture safety limits. A long scan must not grow memory without bound.
 MAX_CAPTURE_PACKETS = 200_000
 MAX_TIMELINE_POINTS = 20_000
+MAX_CAPTURE_OUTPUT = 48 * 1024 * 1024
 
 
-def secure_output_dir(path):
-    """Create *path* and, on POSIX, restrict it to the owner."""
-    os.makedirs(path, exist_ok=True)
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
-    return path
+def clean_text(value, limit=200):
+    """Sanitise a value that came from the network before it is stored/printed."""
+    return sanitize_console_text(value, limit)
 
 
-def secure_file(path):
-    """Restrict *path* to the owner on POSIX."""
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+def tshark_path():
+    """Return the absolute path to a trusted tshark, or raise FileNotFoundError."""
+    path = resolve_tool("tshark")
+    if not path:
+        raise FileNotFoundError(
+            "tshark was not found in a trusted absolute PATH directory"
+        )
     return path
 
 
@@ -185,30 +187,36 @@ AUTHOR:
 def check_tshark():
     """Check if tshark is available on the system."""
     try:
-        result = subprocess.run(
-            ["tshark", "--version"],
-            capture_output=True, text=True, timeout=10
+        executable = tshark_path()
+        result = run_bounded(
+            [executable, "--version"],
+            timeout=10,
+            max_stdout=4096,
+            max_stderr=4096,
         )
         if result.returncode == 0:
             version_line = result.stdout.split("\n")[0]
-            print(f"[OK] tshark found: {version_line}")
+            print(f"[OK] tshark found: {clean_text(version_line, 200)}")
             return True
         print("[ERROR] tshark returned non-zero exit code.")
         return False
     except FileNotFoundError:
-        print("[ERROR] tshark not found. Install Wireshark and add to PATH.")
+        print("[ERROR] tshark not found. Install Wireshark and put it in a "
+              "trusted absolute PATH directory.")
         return False
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {clean_text(e, 200)}")
         return False
 
 
 def get_interfaces():
     """List available network interfaces for capture."""
     try:
-        result = subprocess.run(
-            ["tshark", "-D"],
-            capture_output=True, text=True, timeout=10
+        result = run_bounded(
+            [tshark_path(), "-D"],
+            timeout=10,
+            max_stdout=1024 * 1024,
+            max_stderr=4096,
         )
         interfaces = []
         for line in result.stdout.strip().split("\n"):
@@ -216,12 +224,12 @@ def get_interfaces():
             if match:
                 interfaces.append({
                     "index": int(match.group(1)),
-                    "name": match.group(2),
-                    "description": match.group(3),
+                    "name": clean_text(match.group(2), 128),
+                    "description": clean_text(match.group(3), 256),
                 })
         return interfaces
     except Exception as e:
-        print(f"[ERROR] Failed to list interfaces: {e}")
+        print(f"[ERROR] Failed to list interfaces: {clean_text(e, 200)}")
         return []
 
 
@@ -245,9 +253,8 @@ def capture_traffic(interface, duration=15, bpf_filter=None):
     name and owner-only permissions. Callers are responsible for deleting it
     unless the operator explicitly asked to keep it.
     """
-    fd, pcap_file = tempfile.mkstemp(prefix="flashnet_capture_", suffix=".pcapng")
+    fd, pcap_file = create_secure_temp_file(prefix="flashnet_capture_", suffix=".pcapng")
     os.close(fd)
-    secure_file(pcap_file)
 
     fields = [
         "frame.time_epoch",
@@ -267,7 +274,7 @@ def capture_traffic(interface, duration=15, bpf_filter=None):
     ]
 
     cmd = [
-        "tshark",
+        tshark_path(),
         "-i", str(interface["index"]),
         "-a", f"duration:{duration}",
         "-w", pcap_file,
@@ -282,14 +289,28 @@ def capture_traffic(interface, duration=15, bpf_filter=None):
     if bpf_filter:
         cmd.append(bpf_filter)
 
-    print(f"\n[CAPTURE] Capturing {duration}s on interface {interface['name']} ({interface['description']})...")
+    print(f"\n[CAPTURE] Capturing {duration}s on interface "
+          f"{clean_text(interface['name'], 128)} "
+          f"({clean_text(interface['description'], 256)})...")
     print(f"        Temporary capture: {pcap_file}")
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stdout, stderr = process.communicate()
+    result = run_bounded(
+        cmd,
+        timeout=duration + 60,
+        max_stdout=MAX_CAPTURE_OUTPUT,
+        max_stderr=64 * 1024,
+    )
+    stdout = result.stdout
 
-    if process.returncode != 0 and stderr.strip():
-        print(f"[WARN] tshark exited {process.returncode}: {stderr.strip()[:200]}")
+    if result.timed_out:
+        print(f"[WARN] tshark capture timed out after {duration + 60}s; "
+              f"analyzing packets captured so far.")
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"[WARN] tshark exited {result.returncode}: "
+              f"{clean_text(result.stderr.strip(), 200)}")
+    if result.stdout_truncated:
+        print("[WARN] tshark output exceeded the capture output cap; "
+              "older packets may be missing.")
 
     packets = []
     truncated = False
@@ -319,17 +340,17 @@ def analyze_packets(packets):
     timeline_stride = max(1, len(packets) // MAX_TIMELINE_POINTS)
 
     for index, pkt in enumerate(packets):
-        src_mac = (pkt.get("eth.src") or "").strip()
-        dst_mac = (pkt.get("eth.dst") or "").strip()
-        src_ip = (pkt.get("ip.src") or "").strip()
-        dst_ip = (pkt.get("ip.dst") or "").strip()
+        src_mac = clean_text((pkt.get("eth.src") or "").strip(), 64)
+        dst_mac = clean_text((pkt.get("eth.dst") or "").strip(), 64)
+        src_ip = clean_text((pkt.get("ip.src") or "").strip(), 64)
+        dst_ip = clean_text((pkt.get("ip.dst") or "").strip(), 64)
         frame_len = safe_int(pkt.get("frame.len"), 0)
-        protocols = (pkt.get("frame.protocols") or "").strip()
-        col_proto = (pkt.get("_ws.col.Protocol") or "").strip()
-        hostname = (pkt.get("dhcp.options.hostname") or "").strip()
-        http_host = (pkt.get("http.host") or "").strip()
-        user_agent = (pkt.get("http.user_agent") or "").strip()
-        mdns_name = (pkt.get("mdns.host_name") or "").strip()
+        protocols = clean_text((pkt.get("frame.protocols") or "").strip(), 256)
+        col_proto = clean_text((pkt.get("_ws.col.Protocol") or "").strip(), 64)
+        hostname = clean_text((pkt.get("dhcp.options.hostname") or "").strip(), 128)
+        http_host = clean_text((pkt.get("http.host") or "").strip(), 200)
+        user_agent = clean_text((pkt.get("http.user_agent") or "").strip(), 200)
+        mdns_name = clean_text((pkt.get("mdns.host_name") or "").strip(), 128)
         epoch = safe_float(pkt.get("frame.time_epoch"), 0.0)
 
         if not src_mac and not src_ip:
@@ -400,9 +421,9 @@ def analyze_packets(packets):
     for mac, dev in devices.items():
         if dev["device_type"] == "Unknown" and is_usable_mac(mac):
             oui = mac[:8].upper()
-            if oui in ("00:1A:", "00:1B:", "00:22:", "AC:DE:"):
+            if any(oui.startswith(prefix) for prefix in ("00:1A:", "00:1B:", "00:22:", "AC:DE:")):
                 dev["device_type"] = "Router / Network Device"
-            elif oui in ("00:0C:", "00:0D:", "00:1E:"):
+            elif any(oui.startswith(prefix) for prefix in ("00:0C:", "00:0D:", "00:1E:")):
                 dev["device_type"] = "IoT Device"
 
     return devices, total_bytes, protocol_counts, timeline
@@ -496,9 +517,9 @@ def print_summary(report):
     print("\n" + "=" * 60)
     print("  FLASH_NETWORK — Wireshark Scan Summary")
     print("=" * 60)
-    print(f"  Interface   : {meta['interface_description']}")
+    print(f"  Interface   : {clean_text(meta['interface_description'], 256)}")
     print(f"  Duration    : {meta['capture_duration_sec']}s")
-    print(f"  Timestamp   : {meta['timestamp']}")
+    print(f"  Timestamp   : {clean_text(meta['timestamp'], 64)}")
     print("-" * 60)
 
     print(f"\n  THROUGHPUT:")
@@ -510,23 +531,27 @@ def print_summary(report):
     print(f"\n  PROTOCOL DISTRIBUTION (Top 15):")
     for proto, count in list(report["protocol_distribution"].items())[:15]:
         bar = "#" * min(count, 50)
-        print(f"    {proto:<20} {count:>6}  {bar}")
+        print(f"    {clean_text(proto, 64):<20} {count:>6}  {bar}")
 
     print(f"\n  DEVICES DETECTED: {report['devices_detected']}")
     print("-" * 60)
 
     for i, dev in enumerate(report["devices"], 1):
-        print(f"\n  [{i}] {dev['hostname']}")
-        print(f"      MAC     : {dev['mac_address']}")
-        print(f"      IPs     : {', '.join(dev['ip_addresses']) if dev['ip_addresses'] else 'N/A'}")
-        print(f"      Type    : {dev['device_type']}")
+        print(f"\n  [{i}] {clean_text(dev['hostname'], 128)}")
+        print(f"      MAC     : {clean_text(dev['mac_address'], 64)}")
+        ips = ", ".join(clean_text(ip, 64) for ip in dev["ip_addresses"]) or "N/A"
+        print(f"      IPs     : {ips}")
+        print(f"      Type    : {clean_text(dev['device_type'], 64)}")
         print(f"      Traffic : {dev['traffic']['total_bytes']:,} bytes "
               f"({dev['traffic']['packets_sent']}↑ / {dev['traffic']['packets_received']}↓)")
         if dev["protocols_observed"]:
-            print(f"      Protocols: {', '.join(dev['protocols_observed'][:8])}")
+            protocols = ", ".join(
+                clean_text(p, 64) for p in dev["protocols_observed"][:8]
+            )
+            print(f"      Protocols: {protocols}")
         if dev["hints"]:
             for h in dev["hints"][:3]:
-                print(f"      Hint    : {h}")
+                print(f"      Hint    : {clean_text(h, 220)}")
 
     print("\n" + "=" * 60)
     print(f"  Full report saved to: {report.get('_output_path', 'N/A')}")

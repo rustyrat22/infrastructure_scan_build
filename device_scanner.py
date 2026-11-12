@@ -21,10 +21,19 @@ import re
 import time
 import getpass
 import ipaddress
-import tempfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import defaultdict
+
+from flashnet_common import (
+    create_secure_temp_file,
+    resolve_tool,
+    run_bounded,
+    sanitize_console_text,
+    secure_file,
+    secure_output_dir,
+)
 
 
 # --- Security helpers -------------------------------------------------------
@@ -67,25 +76,53 @@ def safe_output_path(output_dir, filename):
     return candidate
 
 
-def secure_output_dir(path):
-    """Create *path* and, on POSIX, restrict it to the owner."""
-    os.makedirs(path, exist_ok=True)
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
+def clean_text(value, limit=200):
+    """Sanitise attacker-controlled text before storing or printing it."""
+    return sanitize_console_text(value, limit)
+
+
+def plink_path():
+    """Return the absolute path to a trusted plink, or raise FileNotFoundError."""
+    path = resolve_tool("plink")
+    if not path:
+        raise FileNotFoundError(
+            "plink was not found in a trusted absolute PATH directory"
+        )
     return path
 
 
-def secure_file(path):
-    """Restrict *path* to the owner on POSIX."""
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    return path
+def validate_target(value):
+    """Validate a user-supplied SSH target and reject option injection."""
+    text = str(value or "").strip()
+    if not text:
+        sys.exit("[ERROR] Target must not be empty.")
+    if text.startswith("-"):
+        sys.exit(f"[ERROR] Refusing target that looks like an option: {text!r}")
+    if len(text) > 253:
+        sys.exit("[ERROR] Target is too long (max 253 characters).")
+    if re.search(r"[\s\x00-\x1f\x7f]", text):
+        sys.exit("[ERROR] Target must not contain whitespace or control characters.")
+    return text
+
+
+def validate_user(value):
+    """Validate an SSH username before it is handed to plink."""
+    text = str(value or "").strip()
+    if not text:
+        sys.exit("[ERROR] SSH username must not be empty.")
+    if text.startswith("-"):
+        sys.exit(f"[ERROR] Refusing username that looks like an option: {text!r}")
+    if re.search(r"[\s\x00-\x1f\x7f]", text):
+        sys.exit("[ERROR] Username must not contain whitespace or control characters.")
+    return text
+
+
+def is_valid_ipv4(value):
+    """Return True only for a syntactically valid IPv4 address."""
+    try:
+        return ipaddress.ip_address(str(value)).version == 4
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_int_arg(value, option, minimum=None, maximum=None):
@@ -103,14 +140,10 @@ def parse_int_arg(value, option, minimum=None, maximum=None):
 
 def write_password_file(password):
     """Write *password* to a private temp file for `plink -pwfile`."""
-    fd, path = tempfile.mkstemp(prefix="flashnet_pw_", suffix=".txt")
+    fd, path = create_secure_temp_file(prefix="flashnet_pw_", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(password)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
         return path
     except Exception:
         try:
@@ -135,8 +168,10 @@ def remove_password_file(path):
 
 def read_password_file(path):
     """Read the first line of a password file without the trailing newline."""
+    if os.path.getsize(path) > 64 * 1024:
+        raise OSError("Password file is too large (max 64 KiB).")
     with open(path, "r", encoding="utf-8") as handle:
-        return handle.readline().rstrip("\r\n")
+        return handle.readline(4096).rstrip("\r\n")
 
 
 def parse_network(network_range):
@@ -276,69 +311,178 @@ JSON OUTPUT SCHEMA (per device):
 
 
 def check_prerequisites(verbose=False):
-    """Check if tshark and plink are available."""
+    """Check if tshark and plink are available in trusted locations."""
     tools = {}
     for tool in ("tshark", "plink"):
+        path = resolve_tool(tool)
+        if not path:
+            tools[tool] = {"available": False, "version": None, "path": None}
+            print(f"[ERROR] {tool} not found in a trusted absolute PATH directory.")
+            continue
         try:
-            result = subprocess.run(
-                [tool, "--version" if tool == "tshark" else "-V"],
-                capture_output=True, text=True, timeout=10
+            result = run_bounded(
+                [path, "--version" if tool == "tshark" else "-V"],
+                timeout=10,
+                max_stdout=8192,
+                max_stderr=8192,
             )
             out = (result.stdout + result.stderr).strip()
-            version = out.split("\n")[0] if out else "found"
-            tools[tool] = {"available": True, "version": version}
+            version = clean_text(out.split("\n")[0], 200) if out else "found"
+            tools[tool] = {"available": True, "version": version, "path": path}
             if not verbose:
                 print(f"[OK] {tool}: {version}")
-        except FileNotFoundError:
-            tools[tool] = {"available": False, "version": None}
-            print(f"[ERROR] {tool} not found in PATH.")
         except Exception as e:
-            tools[tool] = {"available": False, "version": None}
-            print(f"[ERROR] {tool} check failed: {e}")
+            tools[tool] = {"available": False, "version": None, "path": path}
+            print(f"[ERROR] {tool} check failed: {clean_text(e, 200)}")
     return tools
+
+
+_VIRTUAL_ADAPTER_RE = re.compile(
+    r"(vpn|tap|tun|virtual|vmware|hyper-?v|vethernet|docker|wsl|loopback|"
+    r"bluetooth|zerotier|tailscale|wireguard|openvpn|hamachi|teredo|isatap|"
+    r"6to4|pseudo|npcap|vbox|virtualbox|virbr|cni|flannel|podman|bridge)",
+    re.IGNORECASE,
+)
+
+
+def _is_virtual_adapter(name):
+    return bool(_VIRTUAL_ADAPTER_RE.search(str(name or "")))
+
+
+def _select_network_candidate(candidates):
+    """Prefer a physical adapter that carries the default route."""
+    if not candidates:
+        return None
+    candidates = sorted(
+        candidates,
+        key=lambda item: (
+            item["virtual"],
+            not item["has_gateway"],
+            item["apipa"],
+        ),
+    )
+    return candidates[0]
+
+
+def _windows_network_candidates():
+    """Parse ipconfig into per-adapter IPv4 network candidates."""
+    ipconfig = resolve_tool("ipconfig")
+    if not ipconfig:
+        return []
+    result = run_bounded([ipconfig], timeout=10, max_stdout=1024 * 1024,
+                         max_stderr=64 * 1024)
+    text = result.stdout
+    candidates = []
+    # Each adapter section starts with a non-indented "... adapter ...:" line.
+    blocks = re.split(r"(?im)(?=^[^\s].*\badapter\b[^\r\n]*:\s*$)", text)
+    for block in blocks:
+        if not block.strip():
+            continue
+        header = block.splitlines()[0].strip().rstrip(":")
+        ip_match = re.search(
+            r"IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", block
+        )
+        mask_match = re.search(
+            r"Subnet Mask[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", block
+        )
+        gateway_match = re.search(
+            r"Default Gateway[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", block
+        )
+        if not ip_match or not mask_match:
+            continue
+        ip, mask = ip_match.group(1), mask_match.group(1)
+        if ip.startswith("127.") or mask == "0.0.0.0":
+            continue
+        try:
+            network = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+        except ValueError:
+            continue
+        if not 8 <= network.prefixlen <= 30:
+            continue
+        candidates.append({
+            "name": header,
+            "network": str(network),
+            "prefixlen": network.prefixlen,
+            "has_gateway": bool(gateway_match),
+            "virtual": _is_virtual_adapter(header),
+            "apipa": ip.startswith("169.254."),
+        })
+    return candidates
+
+
+def _posix_ip_path():
+    path = resolve_tool("ip")
+    if path:
+        return path
+    for candidate in ("/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _posix_network_candidates():
+    """Parse `ip -4 addr` into per-interface IPv4 network candidates."""
+    ip_tool = _posix_ip_path()
+    if not ip_tool:
+        return []
+
+    default_iface = None
+    try:
+        routes = run_bounded([ip_tool, "route", "show", "default"], timeout=10,
+                             max_stdout=64 * 1024, max_stderr=16 * 1024)
+        match = re.search(r"\bdev\s+(\S+)", routes.stdout)
+        if match:
+            default_iface = match.group(1)
+    except OSError:
+        pass
+
+    result = run_bounded([ip_tool, "-4", "addr", "show"], timeout=10,
+                         max_stdout=1024 * 1024, max_stderr=64 * 1024)
+    candidates = []
+    current_iface = ""
+    for line in result.stdout.splitlines():
+        header = re.match(r"^\d+:\s+([^:@]+?)(?:@\S+)?:\s", line)
+        if header:
+            current_iface = header.group(1).strip()
+            continue
+        match = re.search(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})", line)
+        if not match or not current_iface:
+            continue
+        ip, prefix = match.group(1), int(match.group(2))
+        if ip.startswith("127.") or not 8 <= prefix <= 30:
+            continue
+        try:
+            network = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        candidates.append({
+            "name": current_iface,
+            "network": str(network),
+            "prefixlen": network.prefixlen,
+            "has_gateway": current_iface == default_iface,
+            "virtual": _is_virtual_adapter(current_iface),
+            "apipa": ip.startswith("169.254."),
+        })
+    return candidates
 
 
 def get_local_network_range():
     """Auto-detect the local IPv4 network, or None when it cannot be determined.
 
-    Windows: pair `IPv4 Address` with `Subnet Mask` from ipconfig.
-    POSIX:   use the first `inet A.B.C.D/NN` from `ip -4 addr`.
+    Physical adapters carrying the default route are preferred; VPN, virtual,
+    container, and loopback adapters are deprioritised so a scan does not
+    silently target a tunnel instead of the LAN.
     """
     try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ["ipconfig"], capture_output=True, text=True, timeout=10
-            )
-            text = result.stdout
-            addresses = re.findall(
-                r"IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", text
-            )
-            masks = re.findall(
-                r"Subnet Mask[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", text
-            )
-            for ip, mask in zip(addresses, masks):
-                if ip.startswith("127.") or mask == "0.0.0.0":
-                    continue
-                try:
-                    net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
-                except ValueError:
-                    continue
-                if 8 <= net.prefixlen <= 30:
-                    return str(net)
-        else:
-            result = subprocess.run(
-                ["ip", "-4", "addr", "show"], capture_output=True, text=True, timeout=10
-            )
-            for match in re.finditer(
-                r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})", result.stdout
-            ):
-                ip, prefix = match.group(1), int(match.group(2))
-                if ip.startswith("127.") or prefix < 8 or prefix > 30:
-                    continue
-                return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+        candidates = (
+            _windows_network_candidates()
+            if sys.platform == "win32"
+            else _posix_network_candidates()
+        )
+        selected = _select_network_candidate(candidates)
+        return selected["network"] if selected else None
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _ping_host(host, timeout):
@@ -401,27 +545,39 @@ def discover_devices_arp(network_range, verbose=False):
 
     try:
         if sys.platform == "win32":
-            result = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
+            arp_tool = resolve_tool("arp")
+            if not arp_tool:
+                if verbose:
+                    print("[WARN] arp not found in a trusted location")
+                return devices
+            result = run_bounded([arp_tool, "-a"], timeout=10,
+                                 max_stdout=1024 * 1024, max_stderr=64 * 1024)
             for line in result.stdout.split("\n"):
                 match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-f\-]{17})", line)
                 if match:
                     ip = match.group(1)
-                    if not ip_in_network(ip, network):
+                    if not is_valid_ipv4(ip) or not ip_in_network(ip, network):
                         continue
                     mac = match.group(2).replace("-", ":")
                     devices.append({"ip": ip, "mac": mac, "hostname": ip, "method": "arp"})
         else:
-            result = subprocess.run(["ip", "neigh"], capture_output=True, text=True, timeout=10)
+            ip_tool = _posix_ip_path()
+            if not ip_tool:
+                if verbose:
+                    print("[WARN] ip not found in a trusted location")
+                return devices
+            result = run_bounded([ip_tool, "neigh"], timeout=10,
+                                 max_stdout=1024 * 1024, max_stderr=64 * 1024)
             for line in result.stdout.split("\n"):
                 parts = line.split()
                 if len(parts) >= 3 and parts[2] not in ("FAILED", "INCOMPLETE"):
                     ip = parts[0]
-                    if not ip_in_network(ip, network):
+                    if not is_valid_ipv4(ip) or not ip_in_network(ip, network):
                         continue
                     devices.append({"ip": ip, "mac": parts[2], "hostname": ip, "method": "arp"})
     except Exception as e:
         if verbose:
-            print(f"[WARN] ARP discovery failed: {e}")
+            print(f"[WARN] ARP discovery failed: {clean_text(e, 200)}")
 
     return devices
 
@@ -435,7 +591,13 @@ def discover_devices_tshark(interface_idx=None, duration=10, network_range=None,
         return devices
 
     try:
-        cmd = ["tshark", "-a", f"duration:{duration}", "-T", "fields",
+        tshark = resolve_tool("tshark")
+        if not tshark:
+            if verbose:
+                print("[WARN] tshark not found in a trusted location")
+            return devices
+
+        cmd = [tshark, "-a", f"duration:{duration}", "-T", "fields",
                "-e", "ip.src", "-e", "ip.dst", "-e", "eth.src", "-e", "eth.dst",
                "-e", "dhcp.options.hostname", "-e", "mdns.host_name",
                "-E", "separator=|"]
@@ -449,7 +611,12 @@ def discover_devices_tshark(interface_idx=None, duration=10, network_range=None,
         if verbose:
             print(f"\n[TSHARK] Capturing {duration}s for device discovery...")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 30)
+        result = run_bounded(
+            cmd, timeout=duration + 30,
+            max_stdout=16 * 1024 * 1024, max_stderr=64 * 1024,
+        )
+        if result.timed_out and verbose:
+            print("[WARN] tshark discovery timed out; using partial output.")
         seen_ips = {}
 
         for line in result.stdout.strip().split("\n"):
@@ -462,20 +629,23 @@ def discover_devices_tshark(interface_idx=None, duration=10, network_range=None,
                 hostname = parts[4].strip() if len(parts) > 4 else ""
                 if not hostname:
                     hostname = parts[5].strip() if len(parts) > 5 else ""
+                ip = clean_text(ip, 64)
+                mac = clean_text(mac, 64)
+                hostname = clean_text(hostname, 128)
 
-                if (ip and not ip.startswith(("127.", "224.", "239.", "255."))
+                if (is_valid_ipv4(ip) and not ip.startswith(("127.", "224.", "239.", "255."))
                         and ip not in seen_ips
                         and (network is None or ip_in_network(ip, network))):
                     seen_ips[ip] = True
                     devices.append({
                         "ip": ip,
-                        "mac": mac if mac != "00:00:00:00:00:00" else "N/A",
+                        "mac": mac if mac and mac != "00:00:00:00:00:00" else "N/A",
                         "hostname": hostname if hostname else ip,
                         "method": "tshark",
                     })
     except Exception as e:
         if verbose:
-            print(f"[WARN] tshark discovery failed: {e}")
+            print(f"[WARN] tshark discovery failed: {clean_text(e, 200)}")
 
     return devices
 
@@ -507,7 +677,9 @@ def discover_devices(network_range, mode="all", interface_idx=None, max_devices=
 
 def run_plink(target, port, user, cmd, auth_args, timeout=30, batch=True, verbose=False):
     """Execute a single command on a remote device via plink."""
-    base_cmd = ["plink"]
+    if not is_valid_ipv4(target):
+        return "", "Refusing non-IPv4 target", -1
+    base_cmd = [plink_path()]
     if batch:
         base_cmd.append("-batch")
     base_cmd.extend(["-P", str(port), "-l", user])
@@ -516,12 +688,22 @@ def run_plink(target, port, user, cmd, auth_args, timeout=30, batch=True, verbos
     base_cmd.extend([target, cmd])
 
     try:
-        result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=timeout)
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        return "", f"Timeout after {timeout}s", -1
+        result = run_bounded(
+            base_cmd,
+            timeout=timeout,
+            max_stdout=4 * 1024 * 1024,
+            max_stderr=1024 * 1024,
+        )
+        stderr = result.stderr
+        if result.timed_out:
+            stderr = (stderr + "\n" if stderr else "") + f"Timeout after {timeout}s"
+        if result.stdout_truncated and verbose:
+            print(f"  [WARN] plink stdout for {target} was truncated")
+        return result.stdout, stderr, result.returncode
+    except FileNotFoundError:
+        return "", "plink not found in a trusted location", -1
     except Exception as e:
-        return "", str(e), -1
+        return "", clean_text(e, 200), -1
 
 
 def get_device_commands(os_type):
@@ -533,6 +715,7 @@ def get_device_commands(os_type):
             "architecture": "uname -m",
             "dpkg": "dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Status}|${installed-size}\\n' 2>/dev/null",
             "rpm": "rpm -qa --queryformat '%{NAME}|%{VERSION}|%{VENDOR}|installed|%{INSTALLTIME}\\n' 2>/dev/null",
+            "pacman": "pacman -Qi --color never 2>/dev/null | grep -E '^(Name|Version|Packager|Install Date|Architecture|URL)'",
             "snap": "snap list 2>/dev/null",
             "pip": "pip3 list --format=json 2>/dev/null || pip list --format=json 2>/dev/null",
             "cpu": "lscpu 2>/dev/null | grep 'Model name' | cut -d: -f2",
@@ -582,52 +765,126 @@ def detect_os(target, port, user, auth_args, timeout, verbose):
     return "unknown"
 
 
-def parse_linux_apps(stdout_map):
-    """Parse Linux application lists."""
+def _app_record(name="", version="", source="", signer="", publisher="",
+                install_location="", install_date="", architecture="", url=""):
+    """Build a sanitised application record."""
+    return {
+        "name": clean_text(name, 256),
+        "version": clean_text(version, 128),
+        "last_update": clean_text(install_date, 64),
+        "signer": clean_text(signer, 256),
+        "install_location": clean_text(install_location, 512),
+        "url": clean_text(url, 512),
+        "publisher": clean_text(publisher, 256),
+        "install_date": clean_text(install_date, 64),
+        "architecture": clean_text(architecture, 32),
+        "source": clean_text(source, 32),
+    }
+
+
+def parse_snap_list(output):
+    """Parse `snap list` output (whitespace columns, not pipe-delimited)."""
     apps = []
-    sources = {"dpkg": "dpkg", "rpm": "rpm", "snap": "snap", "pip": "pip"}
-
-    for key, source in sources.items():
-        output = stdout_map.get(key, "")
-        if not output:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith(("name ", "error:", "no snaps")):
             continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", name):
+            continue
+        publisher = parts[4].rstrip("*✓") if len(parts) > 4 else ""
+        apps.append(_app_record(
+            name=name, version=parts[1], source="snap", publisher=publisher,
+        ))
+    return apps
 
-        if source == "pip":
-            try:
-                for pkg in json.loads(output):
-                    apps.append({
-                        "name": pkg.get("name", ""),
-                        "version": pkg.get("version", ""),
-                        "last_update": "",
-                        "signer": "",
-                        "install_location": "",
-                        "url": "",
-                        "publisher": "",
-                        "install_date": "",
-                        "architecture": "",
-                        "source": "pip",
-                    })
-            except json.JSONDecodeError:
-                pass
-        else:
-            for line in output.strip().split("\n"):
-                if "|" not in line:
-                    continue
-                parts = line.split("|")
-                app = {
-                    "name": parts[0].strip(),
-                    "version": parts[1].strip() if len(parts) > 1 else "",
-                    "last_update": "",
-                    "signer": parts[2].strip() if len(parts) > 2 else "",
-                    "install_location": "",
-                    "url": "",
-                    "publisher": parts[2].strip() if len(parts) > 2 else "",
-                    "install_date": "",
-                    "architecture": "",
-                    "source": source,
-                }
-                if app["name"]:
-                    apps.append(app)
+
+def parse_pacman_query(output):
+    """Parse `pacman -Qi` key/value blocks."""
+    apps = []
+    current = {}
+
+    def flush():
+        if current.get("Name"):
+            apps.append(_app_record(
+                name=current.get("Name", ""),
+                version=current.get("Version", ""),
+                source="pacman",
+                signer=current.get("Packager", ""),
+                publisher=current.get("Packager", ""),
+                url=current.get("URL", ""),
+                install_date=current.get("Install Date", ""),
+                architecture=current.get("Architecture", ""),
+            ))
+
+    for line in output.splitlines():
+        if not line.strip():
+            flush()
+            current = {}
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key in ("Name", "Version", "Packager", "Install Date",
+                   "Architecture", "URL", "Description"):
+            current[key] = value.strip()
+    flush()
+    return apps
+
+
+def parse_choco_list(output):
+    """Parse `choco list -l -r` output (`name|version`)."""
+    apps = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        name, _, version = line.partition("|")
+        name, version = name.strip(), version.strip()
+        if not name or name.lower().startswith("chocolatey"):
+            continue
+        apps.append(_app_record(name=name, version=version, source="choco"))
+    return apps
+
+
+def parse_linux_apps(stdout_map):
+    """Parse Linux application lists from dpkg, rpm, pacman, snap, and pip."""
+    apps = []
+
+    for source in ("dpkg", "rpm"):
+        output = stdout_map.get(source, "")
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            parts = line.split("|")
+            app = _app_record(
+                name=parts[0].strip(),
+                version=parts[1].strip() if len(parts) > 1 else "",
+                source=source,
+                signer=parts[2].strip() if len(parts) > 2 else "",
+                publisher=parts[2].strip() if len(parts) > 2 else "",
+            )
+            if app["name"]:
+                apps.append(app)
+
+    apps.extend(parse_pacman_query(stdout_map.get("pacman", "")))
+    apps.extend(parse_snap_list(stdout_map.get("snap", "")))
+
+    pip_out = stdout_map.get("pip", "")
+    if pip_out:
+        try:
+            for pkg in json.loads(pip_out):
+                apps.append(_app_record(
+                    name=pkg.get("name", ""),
+                    version=pkg.get("version", ""),
+                    source="pip",
+                ))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return apps
 
@@ -666,32 +923,25 @@ def parse_windows_apps(stdout_map):
 
             if field == "DisplayName":
                 current = flush(apps, current)
-                current = {
-                    "name": value,
-                    "version": "",
-                    "last_update": "",
-                    "signer": "",
-                    "install_location": "",
-                    "url": "",
-                    "publisher": "",
-                    "install_date": "",
-                    "architecture": "x86" if key == "reg32" else "x64",
-                    "source": "registry",
-                }
+                current = _app_record(
+                    name=value,
+                    architecture="x86" if key == "reg32" else "x64",
+                    source="registry",
+                )
                 continue
 
             if current is None:
                 continue
             if field == "DisplayVersion":
-                current["version"] = value
+                current["version"] = clean_text(value, 128)
             elif field == "Publisher":
-                current["publisher"] = value
-                current["signer"] = value
+                current["publisher"] = clean_text(value, 256)
+                current["signer"] = clean_text(value, 256)
             elif field == "InstallLocation":
-                current["install_location"] = value
+                current["install_location"] = clean_text(value, 512)
             elif field == "InstallDate":
-                current["install_date"] = value
-                current["last_update"] = value
+                current["install_date"] = clean_text(value, 64)
+                current["last_update"] = clean_text(value, 64)
 
         flush(apps, current)
 
@@ -700,20 +950,15 @@ def parse_windows_apps(stdout_map):
     if winget_out:
         for line in winget_out.strip().split("\n")[3:]:
             parts = line.split()
-            if len(parts) >= 3:
-                apps.append({
-                    "name": " ".join(parts[:-2]),
-                    "version": parts[-2],
-                    "last_update": "",
-                    "signer": "",
-                    "install_location": "",
-                    "url": "",
-                    "publisher": parts[-1] if len(parts) > 3 else "",
-                    "install_date": "",
-                    "architecture": "",
-                    "source": "winget",
-                })
+            if len(parts) >= 3 and not line.strip().startswith("-"):
+                apps.append(_app_record(
+                    name=" ".join(parts[:-2]),
+                    version=parts[-2],
+                    source="winget",
+                    publisher=parts[-1] if len(parts) > 3 else "",
+                ))
 
+    apps.extend(parse_choco_list(stdout_map.get("choco", "")))
     return apps
 
 
@@ -729,19 +974,15 @@ def parse_macos_apps(stdout_map):
             if name and len(name) > 2 and "Version" not in name:
                 if current.get("name"):
                     apps.append(current)
-                current = {
-                    "name": name, "version": "", "last_update": "", "signer": "",
-                    "install_location": "", "url": "", "publisher": "",
-                    "install_date": "", "architecture": "", "source": "macos_apps",
-                }
+                current = _app_record(name=name, source="macos_apps")
         elif "Version:" in line and current:
             match = re.search(r"Version:\s*(.+)", line)
             if match:
-                current["version"] = match.group(1).strip()
+                current["version"] = clean_text(match.group(1).strip(), 128)
         elif "Location:" in line and current:
             match = re.search(r"Location:\s*(.+)", line)
             if match:
-                current["install_location"] = match.group(1).strip()
+                current["install_location"] = clean_text(match.group(1).strip(), 512)
 
     if current.get("name"):
         apps.append(current)
@@ -752,13 +993,11 @@ def parse_macos_apps(stdout_map):
         for line in brew_out.strip().split("\n"):
             parts = line.split()
             if parts:
-                apps.append({
-                    "name": parts[0],
-                    "version": parts[1] if len(parts) > 1 else "",
-                    "last_update": "", "signer": "", "install_location": "",
-                    "url": "", "publisher": "", "install_date": "",
-                    "architecture": "", "source": "brew",
-                })
+                apps.append(_app_record(
+                    name=parts[0],
+                    version=parts[1] if len(parts) > 1 else "",
+                    source="brew",
+                ))
 
     return apps
 
@@ -780,7 +1019,8 @@ def enumerate_device(target, port, user, auth_args, timeout, verbose):
         stdout_map[label] = stdout
         scan_methods.append(label)
         if rc != 0 and stderr.strip():
-            errors.append({"command": label, "error": stderr[:200]})
+            errors.append({"command": clean_text(label, 64),
+                           "error": clean_text(stderr, 200)})
 
     # Parse applications
     parsers = {"linux": parse_linux_apps, "windows": parse_windows_apps, "macos": parse_macos_apps}
@@ -798,13 +1038,13 @@ def enumerate_device(target, port, user, auth_args, timeout, verbose):
     duration = time.time() - start
 
     return {
-        "hostname": stdout_map.get("hostname", "").strip(),
-        "os": stdout_map.get("os_info", "").strip()[:200],
-        "architecture": stdout_map.get("architecture", "").strip(),
-        "cpu": stdout_map.get("cpu", "").strip(),
-        "memory": stdout_map.get("memory", "").strip(),
+        "hostname": clean_text(stdout_map.get("hostname", "").strip(), 128),
+        "os": clean_text(stdout_map.get("os_info", "").strip(), 200),
+        "architecture": clean_text(stdout_map.get("architecture", "").strip(), 64),
+        "cpu": clean_text(stdout_map.get("cpu", "").strip(), 200),
+        "memory": clean_text(stdout_map.get("memory", "").strip(), 128),
         "applications": unique_apps,
-        "scan_methods": scan_methods,
+        "scan_methods": [clean_text(method, 64) for method in scan_methods],
         "os_detected": os_type,
         "duration": round(duration, 2),
         "errors": errors,
@@ -892,12 +1132,16 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
     results = []
     for i, dev in enumerate(devices, 1):
         ip = dev["ip"]
+        if not is_valid_ipv4(ip):
+            results.append({"ip": clean_text(ip, 64), "hostname": "", "status": "error",
+                            "error": "Refusing non-IPv4 target"})
+            continue
         mac = dev.get("mac", "N/A")
         hostname = dev.get("hostname", ip)
         timestamp = datetime.now(timezone.utc).isoformat()
 
         if not quiet:
-            print(f"\n  [{i}/{len(devices)}] {hostname} ({ip})...")
+            print(f"\n  [{i}/{len(devices)}] {clean_text(hostname, 128)} ({ip})...")
 
         try:
             enum_result = enumerate_device(ip, port, user, auth_args, timeout, verbose)
@@ -911,20 +1155,39 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
                             "apps": len(report["applications"]), "duration": enum_result["duration"]})
 
             if not quiet:
-                print(f"    [+] {enum_result.get('os_detected', 'unknown')} | "
+                print(f"    [+] {clean_text(enum_result.get('os_detected', 'unknown'), 32)} | "
                       f"{len(report['applications'])} apps | {enum_result['duration']}s | {filepath}")
 
         except Exception as e:
             results.append({"ip": ip, "hostname": hostname, "status": "error", "error": str(e)})
             if not quiet:
-                print(f"    [-] Failed: {e}")
+                print(f"    [-] Failed: {clean_text(e, 200)}")
 
     total_time = round(time.time() - start_time, 2)
     successful = sum(1 for r in results if r["status"] == "success")
     total_apps = sum(r.get("apps", 0) for r in results if r["status"] == "success")
 
-    # Write scan index
+    # Keep scan_index.json current, but archive the previous index so history
+    # is not lost every time the scanner runs.
     secure_output_dir(output_dir)
+    index_path = safe_output_path(output_dir, "scan_index.json")
+    if os.path.exists(index_path):
+        archive_name = (
+            "scan_index_"
+            + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+            + ".json"
+        )
+        archive_path = safe_output_path(output_dir, archive_name)
+        try:
+            try:
+                os.replace(index_path, archive_path)
+            except OSError:
+                shutil.copy2(index_path, archive_path)
+                os.remove(index_path)
+            secure_file(archive_path)
+        except OSError as exc:
+            print(f"[WARN] Could not archive previous scan index: {clean_text(exc, 200)}")
+
     index = {
         "scan_timestamp": datetime.now(timezone.utc).isoformat(),
         "network_range": network_range,
@@ -935,7 +1198,6 @@ def scan_and_populate(network_range=None, mode="all", interface_idx=None, max_de
         "total_duration_seconds": total_time,
         "devices": results,
     }
-    index_path = os.path.join(output_dir, "scan_index.json")
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
     secure_file(index_path)
@@ -1031,12 +1293,16 @@ def main():
             i += 2
         elif args[i] == "--list-interfaces":
             try:
-                result = subprocess.run(["tshark", "-D"], capture_output=True, text=True, timeout=10)
+                tshark = resolve_tool("tshark")
+                if not tshark:
+                    raise FileNotFoundError("tshark not found in a trusted location")
+                result = run_bounded([tshark, "-D"], timeout=10,
+                                     max_stdout=1024 * 1024, max_stderr=64 * 1024)
                 print("Available interfaces:")
                 for line in result.stdout.strip().split("\n"):
-                    print(f"  {line}")
+                    print(f"  {clean_text(line, 256)}")
             except Exception as e:
-                print(f"[ERROR] {e}")
+                print(f"[ERROR] {clean_text(e, 200)}")
             sys.exit(0)
         elif args[i] in ("-v", "--verbose"):
             verbose = True
@@ -1055,6 +1321,8 @@ def main():
         sys.exit(f"[ERROR] Invalid mode {mode!r}. Choose one of: {', '.join(valid_modes)}.")
     if mode == "tshark" and interface_idx is None:
         sys.exit("[ERROR] --mode tshark requires --interface INDEX (see --list-interfaces).")
+
+    user = validate_user(user)
 
     selected_password_sources = sum(bool(v) for v in (password_file, password_stdin, ask_password))
     if selected_password_sources > 1:

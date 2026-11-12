@@ -1,5 +1,4 @@
-﻿#Requires -RunAsAdministrator
-<#
+﻿<#
 .SYNOPSIS
     Flash_Network — PuTTY/Plink Device Enumerator (PowerShell)
     Uses plink.exe to connect to remote devices via SSH and enumerate
@@ -90,6 +89,152 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+$script:PlinkPath = $null
+$script:MaxToolOutputBytes = 8 * 1024 * 1024
+
+function Resolve-TrustedTool {
+    # Resolve a native tool to an absolute path, ignoring relative PATH entries
+    # and anything inside the current directory. This blocks PATH hijacking.
+    param([string]$Name, [string[]]$FallbackDirs = @())
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+
+    $cwdFull = [System.IO.Path]::GetFullPath((Get-Location).Path)
+    $cwd = $cwdFull.TrimEnd([char[]]@('\', '/'))
+    # Running from a drive/share root must not make every absolute path look
+    # "inside the working directory", which would reject all tools on it.
+    $cwdIsRoot = ($cwd -eq [System.IO.Path]::GetPathRoot($cwdFull).TrimEnd([char[]]@('\', '/')))
+    $extensions = @("")
+    if ($env:OS -eq "Windows_NT" -and -not [System.IO.Path]::HasExtension($Name)) {
+        $extensions = @(".exe", ".cmd", ".bat", "")
+    }
+
+    $directories = @()
+    foreach ($entry in ($env:PATH -split [System.IO.Path]::PathSeparator)) {
+        $candidateDir = $entry.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($candidateDir)) { continue }
+        if (-not [System.IO.Path]::IsPathRooted($candidateDir)) { continue }
+        $directories += $candidateDir
+    }
+    if ($env:OS -eq "Windows_NT" -and $env:SystemRoot) {
+        $directories += [System.IO.Path]::Combine($env:SystemRoot, "System32")
+    }
+    $directories += $FallbackDirs
+
+    foreach ($directory in $directories) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        foreach ($extension in $extensions) {
+            $candidate = [System.IO.Path]::Combine($directory, $Name + $extension)
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $full = [System.IO.Path]::GetFullPath($candidate)
+            if (-not $cwdIsRoot -and ($full -eq $cwd -or $full.StartsWith($cwd + [System.IO.Path]::DirectorySeparatorChar,
+                    [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+            return $full
+        }
+    }
+    return $null
+}
+
+function Clear-UnsafeText {
+    param([string]$Value, [int]$MaxLength = 200)
+    if ($null -eq $Value) { return "" }
+    $text = [regex]::Replace([string]$Value, "\x1B\[[0-?]*[ -/]*[@-~]", "")
+    $text = [regex]::Replace($text, "\x1B\][^\x07]*(?:\x07|\x1B\\)", "")
+    $text = [regex]::Replace($text, "\x1B[@-_]", "")
+    $text = [regex]::Replace($text, "[\u202A-\u202E\u2066-\u2069]", "")
+    $text = [regex]::Replace($text, "[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "")
+    $text = $text -replace "`r|`n", " "
+    if ($MaxLength -gt 0 -and $text.Length -gt $MaxLength) {
+        $text = $text.Substring(0, $MaxLength)
+    }
+    return $text
+}
+
+function Clear-UnsafeBlock {
+    # Strip terminal escapes from command output while preserving the line
+    # structure the operator explicitly asked to see.
+    param([string]$Value, [int]$MaxLength = 0)
+    if ($null -eq $Value) { return "" }
+    $text = [regex]::Replace([string]$Value, "\x1B\[[0-?]*[ -/]*[@-~]", "")
+    $text = [regex]::Replace($text, "\x1B\][^\x07]*(?:\x07|\x1B\\)", "")
+    $text = [regex]::Replace($text, "\x1B[@-_]", "")
+    $text = [regex]::Replace($text, "[\u202A-\u202E\u2066-\u2069]", "")
+    $text = [regex]::Replace($text, "[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "")
+    $text = $text -replace "`r", ""
+    if ($MaxLength -gt 0 -and $text.Length -gt $MaxLength) {
+        $text = $text.Substring(0, $MaxLength)
+    }
+    return $text
+}
+
+function Test-ValidTarget {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value.StartsWith("-")) { return $false }
+    if ($Value.Length -gt 253) { return $false }
+    if ($Value -match '[\s\x00-\x1F\x7F]') { return $false }
+    return $true
+}
+
+function Stop-ProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    if ($null -eq $Process) { return }
+    try {
+        if ($Process.HasExited) { return }
+        if ($env:OS -eq "Windows_NT") {
+            $taskkill = $null
+            if ($env:SystemRoot) {
+                $candidate = [System.IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $taskkill = $candidate }
+            }
+            if ($taskkill) {
+                & $taskkill /F /T /PID $Process.Id 2>$null | Out-Null
+            } else {
+                & taskkill /F /T /PID $Process.Id 2>$null | Out-Null
+            }
+        } else {
+            & kill -KILL $Process.Id 2>$null
+        }
+    } catch { }
+    try {
+        if (-not $Process.HasExited) { $Process.Kill() }
+    } catch { }
+}
+
+function New-SecureTempFile {
+    param([string]$Extension = ".tmp")
+    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+        "flashnet_" + [guid]::NewGuid().ToString("N") + $Extension)
+    $stream = [System.IO.File]::Create($path)
+    $stream.Close()
+    Set-RestrictiveFileAcl -Path $path
+    return $path
+}
+
+function Read-BoundedTextFile {
+    param([string]$Path, [int]$MaxBytes = 8388608)
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $length = [int][Math]::Min($stream.Length, [long]$MaxBytes)
+            if ($length -le 0) { return "" }
+            $buffer = New-Object byte[] $length
+            $read = 0
+            while ($read -lt $length) {
+                $count = $stream.Read($buffer, $read, $length - $read)
+                if ($count -le 0) { break }
+                $read += $count
+            }
+            return [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
+
 function Write-Header {
     param([string]$Text)
     Write-Host ""
@@ -168,6 +313,25 @@ function ConvertTo-SafeFileName {
     return $safe
 }
 
+function Assert-NoReparsePoints {
+    param([string]$Base, [string]$Target)
+    $baseFull = [System.IO.Path]::GetFullPath($Base).TrimEnd([char[]]@('\', '/'))
+    $current = [System.IO.Path]::GetFullPath($Target)
+    $root = [System.IO.Path]::GetPathRoot($baseFull)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to write through a reparse point: $current"
+            }
+        }
+        if ($current -eq $baseFull -or $current -eq $root) { break }
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+    }
+}
+
 function Join-SafeOutputPath {
     param([string]$OutputDir, [string]$FileName)
     $base = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd([char[]]@('\', '/'))
@@ -176,6 +340,7 @@ function Join-SafeOutputPath {
     if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to write outside output directory: $full"
     }
+    Assert-NoReparsePoints -Base $base -Target $full
     return $full
 }
 
@@ -184,21 +349,14 @@ function New-PasswordFile {
     $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
         "flashnet_pw_" + [guid]::NewGuid().ToString("N") + ".txt")
     $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($path, $Password, $utf8)
     try {
-        if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $path
-            $acl.SetAccessRuleProtection($true, $false)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-                "FullControl", "Allow")
-            $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $path -AclObject $acl
-        } else {
-            & chmod 600 $path 2>$null
-        }
-    } catch { }
-    return $path
+        [System.IO.File]::WriteAllText($path, $Password, $utf8)
+        Set-RestrictiveFileAcl -Path $path
+        return $path
+    } catch {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        throw
+    }
 }
 
 function Remove-PasswordFile {
@@ -214,23 +372,28 @@ function Remove-PasswordFile {
 }
 
 function Test-Plink {
+    $script:PlinkPath = Resolve-TrustedTool -Name "plink"
+    if (-not $script:PlinkPath) {
+        Write-Host "[ERROR] plink not found in a trusted absolute PATH directory." -ForegroundColor Red
+        return $false
+    }
     try {
-        $result = & plink -V 2>&1 | Select-Object -First 1
-        if ($result -match "Release") {
-            Write-Host "[OK] plink found: $result" -ForegroundColor Green
+        $result = & $script:PlinkPath -V 2>&1 | Select-Object -First 1
+        if ($result -match "Release|PuTTY") {
+            Write-Host "[OK] plink found: $(Clear-UnsafeText -Value ([string]$result) -MaxLength 200)" -ForegroundColor Green
             return $true
         }
     } catch {}
 
     try {
-        $result = & plink -V 2>&1
+        $result = & $script:PlinkPath -V 2>&1
         if ($result -match "PuTTY") {
             Write-Host "[OK] plink found" -ForegroundColor Green
             return $true
         }
     } catch {}
 
-    Write-Host "[ERROR] plink not found. Install PuTTY and add to PATH." -ForegroundColor Red
+    Write-Host "[ERROR] plink could not be executed." -ForegroundColor Red
     return $false
 }
 
@@ -276,7 +439,8 @@ function Invoke-ProcessWithTimeout {
         [string[]]$Arguments,
         [int]$TimeoutSeconds,
         [string]$StdOutPath = "",
-        [string]$StdErrPath = ""
+        [string]$StdErrPath = "",
+        [int]$MaxOutputBytes = 8388608
     )
 
     $startParams = @{
@@ -290,56 +454,81 @@ function Invoke-ProcessWithTimeout {
 
     $process = Start-Process @startParams
     $timedOut = $false
+    $overflow = $false
 
     try {
-        if ($TimeoutSeconds -le 0) {
-            $process.WaitForExit()
-        } elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            $timedOut = $true
-            try { $process.Kill() } catch { }
+        $deadline = $null
+        if ($TimeoutSeconds -gt 0) { $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
+
+        while (-not $process.HasExited) {
+            if ($MaxOutputBytes -gt 0) {
+                $total = 0
+                foreach ($path in @($StdOutPath, $StdErrPath)) {
+                    if ($path -and (Test-Path -LiteralPath $path)) {
+                        try { $total += (Get-Item -LiteralPath $path -ErrorAction Stop).Length } catch { }
+                    }
+                }
+                if ($total -gt $MaxOutputBytes) {
+                    $overflow = $true
+                    Stop-ProcessTree -Process $process
+                    break
+                }
+            }
+            if ($null -ne $deadline -and [DateTime]::UtcNow -ge $deadline) {
+                $timedOut = $true
+                Stop-ProcessTree -Process $process
+                break
+            }
+            try {
+                if ($process.WaitForExit(200)) { break }
+            } catch {
+                break
+            }
+        }
+
+        if (-not $process.HasExited) {
+            Stop-ProcessTree -Process $process
             try { [void]$process.WaitForExit(2000) } catch { }
         }
     } catch {
-        try { $process.Kill() } catch { }
+        Stop-ProcessTree -Process $process
         throw
     }
 
-    $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
-    return @{ Process = $process; TimedOut = $timedOut; ExitCode = $exitCode }
+    $exitCode = if ($timedOut -or $overflow) { -1 } else { $process.ExitCode }
+    return @{ Process = $process; TimedOut = $timedOut; Truncated = $overflow; ExitCode = $exitCode }
 }
 
 function Set-RestrictiveFileAcl {
     param([string]$Path)
-    try {
-        if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $Path
-            $acl.SetAccessRuleProtection($true, $false)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-                "FullControl", "Allow")
-            $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $Path -AclObject $acl
-        } else {
-            & chmod 600 $Path 2>$null
-        }
-    } catch { }
+    if ($env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } else {
+        & chmod 600 $Path
+        if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for $Path" }
+    }
 }
 
 function Set-RestrictiveDirectoryAcl {
     param([string]$Path)
-    try {
-        if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $Path
-            $acl.SetAccessRuleProtection($true, $false)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-                "FullControl", "Allow")
-            $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $Path -AclObject $acl
-        } else {
-            & chmod 700 $Path 2>$null
-        }
-    } catch { }
+    if ($env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } else {
+        & chmod 700 $Path
+        if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for $Path" }
+    }
 }
 
 function Invoke-PlinkCommand {
@@ -354,7 +543,18 @@ function Invoke-PlinkCommand {
         [bool]$Verbose = $false
     )
 
-    $cmdArgs = @("plink")
+    if (-not $script:PlinkPath) { $script:PlinkPath = Resolve-TrustedTool -Name "plink" }
+    if (-not $script:PlinkPath) {
+        return @{ stdout = ""; stderr = "plink is not available in a trusted location"; exitcode = -1 }
+    }
+    if (-not (Test-ValidTarget -Value $Target)) {
+        return @{ stdout = ""; stderr = "Refusing invalid target"; exitcode = -1 }
+    }
+    if (-not (Test-ValidTarget -Value $User)) {
+        return @{ stdout = ""; stderr = "Refusing invalid username"; exitcode = -1 }
+    }
+
+    $cmdArgs = @()
     if ($Batch) { $cmdArgs += "-batch" }
     $cmdArgs += "-P", $Port.ToString()
     $cmdArgs += "-l", $User
@@ -362,29 +562,30 @@ function Invoke-PlinkCommand {
     $cmdArgs += $Target, $Cmd
 
     if ($Verbose) {
-        Write-Host "  [SSH] ${User}@${Target}:${Port} > $Cmd" -ForegroundColor DarkGray
+        Write-Host "  [SSH] $(Clear-UnsafeText -Value $User -MaxLength 64)@$(Clear-UnsafeText -Value $Target -MaxLength 128):${Port} > $(Clear-UnsafeText -Value $Cmd -MaxLength 60)" -ForegroundColor DarkGray
     }
 
-    $tmpOut = [System.IO.Path]::GetTempFileName()
-    $tmpErr = [System.IO.Path]::GetTempFileName()
+    $tmpOut = New-SecureTempFile -Extension ".out"
+    $tmpErr = New-SecureTempFile -Extension ".err"
 
-    $run = Invoke-ProcessWithTimeout -FilePath "plink" -Arguments $cmdArgs `
-        -TimeoutSeconds $Timeout -StdOutPath $tmpOut -StdErrPath $tmpErr
+    try {
+        $run = Invoke-ProcessWithTimeout -FilePath $script:PlinkPath -Arguments $cmdArgs `
+            -TimeoutSeconds $Timeout -StdOutPath $tmpOut -StdErrPath $tmpErr `
+            -MaxOutputBytes $script:MaxToolOutputBytes
 
-    $stdout = ""
-    $stderr = ""
-    if (Test-Path -LiteralPath $tmpOut) {
-        $stdout = Get-Content -LiteralPath $tmpOut -Raw -Encoding UTF8
-        Remove-Item -LiteralPath $tmpOut -Force
-    }
-    if (Test-Path -LiteralPath $tmpErr) {
-        $stderr = Get-Content -LiteralPath $tmpErr -Raw -Encoding UTF8
-        Remove-Item -LiteralPath $tmpErr -Force
+        $stdout = Read-BoundedTextFile -Path $tmpOut -MaxBytes $script:MaxToolOutputBytes
+        $stderr = Read-BoundedTextFile -Path $tmpErr -MaxBytes $script:MaxToolOutputBytes
+    } finally {
+        Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmpErr -Force -ErrorAction SilentlyContinue
     }
 
     if ($run.TimedOut) {
         if ($stderr) { $stderr += "`n" }
         $stderr += "Command timed out after ${Timeout}s"
+    } elseif ($run.Truncated) {
+        if ($stderr) { $stderr += "`n" }
+        $stderr += "Command output exceeded the ${script:MaxToolOutputBytes}-byte cap"
     }
 
     return @{
@@ -429,6 +630,7 @@ function Get-LinuxCommands {
         listening_ports       = "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"
         installed_packages_deb = "dpkg-query -W -f='`${Package}|`${Version}|`${Maintainer}|`${Status}\n' 2>/dev/null"
         installed_packages_rpm = "rpm -qa --queryformat '%{NAME}|%{VERSION}|%{VENDOR}|installed\n' 2>/dev/null"
+        installed_packages_pacman = "pacman -Qi --color never 2>/dev/null | grep -E '^(Name|Version|Packager|Install Date|Architecture|URL)'"
         snap_packages         = "snap list 2>/dev/null"
         cpu_info              = "lscpu 2>/dev/null | head -20"
         memory                = "free -h 2>/dev/null"
@@ -447,6 +649,8 @@ function Get-WindowsCommands {
         listening_ports         = "netstat -ano | findstr LISTENING"
         installed_apps_registry = "reg query `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`" /s 2>nul | findstr /C:`"DisplayName`" /C:`"DisplayVersion`" /C:`"Publisher`" /C:`"InstallLocation`" /C:`"InstallDate`""
         installed_apps_wow64    = "reg query `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`" /s 2>nul | findstr /C:`"DisplayName`" /C:`"DisplayVersion`" /C:`"Publisher`" /C:`"InstallLocation`" /C:`"InstallDate`""
+        installed_apps_choco    = "choco list -l -r 2>nul"
+        winget_apps             = "winget list --accept-source-agreements 2>nul"
     }
 }
 
@@ -465,22 +669,95 @@ function Get-MacOSCommands {
     }
 }
 
+function New-AppRecord {
+    param(
+        [string]$Name = "", [string]$Version = "", [string]$Signer = "",
+        [string]$InstallLocation = "", [string]$Url = "", [string]$LastUpdate = ""
+    )
+    return [PSCustomObject]@{
+        name             = Clear-UnsafeText -Value $Name -MaxLength 256
+        version          = Clear-UnsafeText -Value $Version -MaxLength 128
+        signer           = Clear-UnsafeText -Value $Signer -MaxLength 256
+        install_location = Clear-UnsafeText -Value $InstallLocation -MaxLength 512
+        url              = Clear-UnsafeText -Value $Url -MaxLength 512
+        last_update      = Clear-UnsafeText -Value $LastUpdate -MaxLength 64
+    }
+}
+
 function Parse-LinuxPackages {
     param([string]$Stdout)
     $apps = @()
-    foreach ($line in $Stdout -split "`n") {
+    foreach ($line in ($Stdout -split "`n")) {
         if ($line -notmatch "\|") { continue }
         $parts = $line -split "\|"
-        if ($parts.Count -ge 2) {
-            $apps += [PSCustomObject]@{
-                name             = $parts[0].Trim()
-                version          = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
-                signer           = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
-                install_location = ""
-                url              = ""
-                last_update      = ""
+        $name = $parts[0].Trim()
+        if (-not $name) { continue }
+        $apps += New-AppRecord -Name $name `
+            -Version $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }) `
+            -Signer $(if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" })
+    }
+    return $apps
+}
+
+function ConvertFrom-SnapList {
+    param([string]$Text)
+    $apps = @()
+    foreach ($line in ($Text -split "`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed -match "^(Name\s|error:|No snaps)") { continue }
+        $parts = $trimmed -split "\s+"
+        if ($parts.Count -lt 2) { continue }
+        $name = $parts[0]
+        if ($name -notmatch "^[A-Za-z0-9][A-Za-z0-9._+-]*$") { continue }
+        $publisher = if ($parts.Count -gt 4) { $parts[4].TrimEnd([char[]]@('*', [char]0x2713)) } else { "" }
+        $apps += New-AppRecord -Name $name -Version $parts[1] -Signer $publisher
+    }
+    return $apps
+}
+
+function ConvertFrom-PacmanQuery {
+    param([string]$Text)
+    $apps = @()
+    $current = @{}
+
+    foreach ($line in ($Text -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if ($current.ContainsKey("Name")) {
+                $apps += New-AppRecord -Name $current["Name"] -Version $current["Version"] `
+                    -Signer $current["Packager"] -Url $current["URL"] `
+                    -LastUpdate $current["Install Date"]
             }
+            $current = @{}
+            continue
         }
+        $index = $line.IndexOf(":")
+        if ($index -lt 1) { continue }
+        $key = $line.Substring(0, $index).Trim()
+        $value = $line.Substring($index + 1).Trim()
+        if ($key -in @("Name", "Version", "Packager", "Install Date", "URL")) {
+            $current[$key] = $value
+        }
+    }
+    if ($current.ContainsKey("Name")) {
+        $apps += New-AppRecord -Name $current["Name"] -Version $current["Version"] `
+            -Signer $current["Packager"] -Url $current["URL"] `
+            -LastUpdate $current["Install Date"]
+    }
+    return $apps
+}
+
+function ConvertFrom-ChocoList {
+    param([string]$Text)
+    $apps = @()
+    foreach ($line in ($Text -split "`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed -notmatch "\|") { continue }
+        $parts = $trimmed -split "\|", 2
+        $name = $parts[0].Trim()
+        if (-not $name -or $name -match "^chocolatey") { continue }
+        $version = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+        $apps += New-AppRecord -Name $name -Version $version
     }
     return $apps
 }
@@ -490,34 +767,46 @@ function Parse-WindowsRegistry {
     $apps = @()
     $current = $null
 
-    foreach ($line in $Stdout -split "`n") {
-        $line = $line.Trim()
-        if ($line -match "DisplayName") {
-            if ($line -match "REG_SZ\s+(.+)") {
-                $current = @{
-                    name = $Matches[1].Trim()
-                    version = ""
-                    signer = ""
-                    install_location = ""
-                    url = ""
-                    last_update = ""
-                }
-            }
-        } elseif ($null -ne $current) {
-            if ($line -match "DisplayVersion" -and $line -match "REG_SZ\s+(.+)") {
-                $current.version = $Matches[1].Trim()
-            } elseif ($line -match "Publisher" -and $line -match "REG_SZ\s+(.+)") {
-                $current.signer = $Matches[1].Trim()
-            } elseif ($line -match "InstallLocation" -and $line -match "REG_SZ\s+(.+)") {
-                $current.install_location = $Matches[1].Trim()
-            } elseif ($line -match "InstallDate" -and $line -match "REG_SZ\s+(.+)") {
-                $current.last_update = $Matches[1].Trim()
-            }
+    foreach ($line in ($Stdout -split "`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) {
+            if ($null -ne $current -and $current.name) { $apps += $current }
+            $current = $null
+            continue
+        }
 
-            if ($current.name -and $current.version) {
-                $apps += [PSCustomObject]$current
-                $current = $null
-            }
+        $match = [regex]::Match($trimmed,
+            '^(DisplayName|DisplayVersion|Publisher|InstallLocation|InstallDate)\s+REG_\w+\s+(.+)$')
+        if (-not $match.Success) { continue }
+        $field = $match.Groups[1].Value
+        $value = $match.Groups[2].Value.Trim()
+
+        if ($field -eq "DisplayName") {
+            if ($null -ne $current -and $current.name) { $apps += $current }
+            $current = New-AppRecord -Name $value
+            continue
+        }
+        if ($null -eq $current) { continue }
+        if ($field -eq "DisplayVersion") { $current.version = Clear-UnsafeText -Value $value -MaxLength 128 }
+        elseif ($field -eq "Publisher") { $current.signer = Clear-UnsafeText -Value $value -MaxLength 256 }
+        elseif ($field -eq "InstallLocation") { $current.install_location = Clear-UnsafeText -Value $value -MaxLength 512 }
+        elseif ($field -eq "InstallDate") { $current.last_update = Clear-UnsafeText -Value $value -MaxLength 64 }
+    }
+    if ($null -ne $current -and $current.name) { $apps += $current }
+    return $apps
+}
+
+function Parse-Winget {
+    param([string]$Stdout)
+    $apps = @()
+    $lines = @($Stdout -split "`n")
+    for ($i = 3; $i -lt $lines.Count; $i++) {
+        $trimmed = $lines[$i].Trim()
+        if (-not $trimmed -or $trimmed -match "^-+$") { continue }
+        $parts = $trimmed -split "\s+"
+        if ($parts.Count -ge 3) {
+            $apps += New-AppRecord -Name ($parts[0..($parts.Count-3)] -join " ") `
+                -Version $parts[-2] -Signer $(if ($parts.Count -gt 3) { $parts[-1] } else { "" })
         }
     }
     return $apps
@@ -533,32 +822,41 @@ function Parse-Applications {
                 $apps += Parse-LinuxPackages -Stdout $StdoutMap[$key]
             }
         }
+        if ($StdoutMap.ContainsKey("installed_packages_pacman") -and $StdoutMap["installed_packages_pacman"]) {
+            $apps += ConvertFrom-PacmanQuery -Text $StdoutMap["installed_packages_pacman"]
+        }
+        if ($StdoutMap.ContainsKey("snap_packages") -and $StdoutMap["snap_packages"]) {
+            $apps += ConvertFrom-SnapList -Text $StdoutMap["snap_packages"]
+        }
     } elseif ($OsType -eq "windows") {
         foreach ($key in @("installed_apps_registry", "installed_apps_wow64")) {
             if ($StdoutMap.ContainsKey($key) -and $StdoutMap[$key]) {
                 $apps += Parse-WindowsRegistry -Stdout $StdoutMap[$key]
             }
         }
+        if ($StdoutMap.ContainsKey("installed_apps_choco") -and $StdoutMap["installed_apps_choco"]) {
+            $apps += ConvertFrom-ChocoList -Text $StdoutMap["installed_apps_choco"]
+        }
+        if ($StdoutMap.ContainsKey("winget_apps") -and $StdoutMap["winget_apps"]) {
+            $apps += Parse-Winget -Stdout $StdoutMap["winget_apps"]
+        }
     } elseif ($OsType -eq "macos") {
-        $lines = $StdoutMap["installed_apps"] -split "`n"
+        $lines = @(($StdoutMap["installed_apps"]) -split "`n")
         $current = $null
         foreach ($line in $lines) {
             if ($line -match "Version:\s*(.+)") {
-                if ($null -eq $current) { $current = @{} }
-                $current.version = $Matches[1].Trim()
+                if ($null -eq $current) { $current = New-AppRecord -Name "" }
+                $current.version = Clear-UnsafeText -Value $Matches[1].Trim() -MaxLength 128
             }
             if ($line -match "Location:\s*(.+)") {
                 if ($null -ne $current -and $current.name) {
-                    $current.install_location = $Matches[1].Trim()
-                    if ($null -eq $current.signer) { $current.signer = "" }
-                    if ($null -eq $current.url) { $current.url = "" }
-                    if ($null -eq $current.last_update) { $current.last_update = "" }
-                    $apps += [PSCustomObject]$current
+                    $current.install_location = Clear-UnsafeText -Value $Matches[1].Trim() -MaxLength 512
+                    $apps += $current
                     $current = $null
                 }
             } elseif ($line.Trim() -and $line.Trim().Length -gt 2 -and $line -notmatch "^\s") {
                 if ($null -eq $current) {
-                    $current = @{ name = $line.Trim().TrimEnd(":") }
+                    $current = New-AppRecord -Name ($line.Trim().TrimEnd(":"))
                 }
             }
         }
@@ -632,33 +930,29 @@ function Enumerate-Device {
         $stdoutMap[$entry.Key] = $result.stdout
         if ($result.exitcode -ne 0 -and $result.stderr) {
             $errors += [PSCustomObject]@{
-                command = $entry.Key
-                error = $result.stderr.Substring(0, [Math]::Min(200, $result.stderr.Length))
+                command = Clear-UnsafeText -Value $entry.Key -MaxLength 64
+                error = Clear-UnsafeText -Value $result.stderr -MaxLength 200
             }
         }
     }
 
     $duration = ((Get-Date) - $startTime).TotalSeconds
 
-    $osValue = ([string]$stdoutMap["os_release"]).Trim()
-    if (-not $osValue) { $osValue = ([string]$stdoutMap["os_info"]).Trim() }
-    if ($osValue.Length -gt 200) { $osValue = $osValue.Substring(0, 200) }
-    $uptimeValue = ([string]$stdoutMap["uptime"]).Trim()
-    if ($uptimeValue.Length -gt 200) { $uptimeValue = $uptimeValue.Substring(0, 200) }
-    $ipConfigValue = ([string]$stdoutMap["ip_config"]).Trim()
-    if ($ipConfigValue.Length -gt 500) { $ipConfigValue = $ipConfigValue.Substring(0, 500) }
-    $portsValue = ([string]$stdoutMap["listening_ports"]).Trim()
-    if ($portsValue.Length -gt 1000) { $portsValue = $portsValue.Substring(0, 1000) }
+    $osValue = Clear-UnsafeText -Value (([string]$stdoutMap["os_release"]).Trim()) -MaxLength 200
+    if (-not $osValue) { $osValue = Clear-UnsafeText -Value (([string]$stdoutMap["os_info"]).Trim()) -MaxLength 200 }
+    $uptimeValue = Clear-UnsafeText -Value (([string]$stdoutMap["uptime"]).Trim()) -MaxLength 200
+    $ipConfigValue = Clear-UnsafeText -Value (([string]$stdoutMap["ip_config"]).Trim()) -MaxLength 500
+    $portsValue = Clear-UnsafeText -Value (([string]$stdoutMap["listening_ports"]).Trim()) -MaxLength 1000
 
     $deviceInfo = [PSCustomObject]@{
-        hostname        = ([string]$stdoutMap["hostname"]).Trim()
+        hostname        = Clear-UnsafeText -Value (([string]$stdoutMap["hostname"]).Trim()) -MaxLength 128
         os              = $osValue
-        architecture    = ([string]$stdoutMap["architecture"]).Trim()
-        kernel          = ([string]$stdoutMap["kernel"]).Trim()
+        architecture    = Clear-UnsafeText -Value (([string]$stdoutMap["architecture"]).Trim()) -MaxLength 64
+        kernel          = Clear-UnsafeText -Value (([string]$stdoutMap["kernel"]).Trim()) -MaxLength 128
         uptime          = $uptimeValue
         ip_config       = $ipConfigValue
-        default_gateway = ([string]$stdoutMap["default_gateway"]).Trim()
-        dns_servers     = ([string]$stdoutMap["dns_servers"]).Trim()
+        default_gateway = Clear-UnsafeText -Value (([string]$stdoutMap["default_gateway"]).Trim()) -MaxLength 256
+        dns_servers     = Clear-UnsafeText -Value (([string]$stdoutMap["dns_servers"]).Trim()) -MaxLength 500
         listening_ports = $portsValue
     }
 
@@ -692,8 +986,8 @@ function Save-Report {
 
     if (!(Test-Path -LiteralPath $OutputDir)) {
         New-Item -ItemType Directory -Path $OutputDir | Out-Null
-        Set-RestrictiveDirectoryAcl -Path $OutputDir
     }
+    Set-RestrictiveDirectoryAcl -Path $OutputDir
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $hostname = ConvertTo-SafeFileName -Value $Report.device_info.hostname -Fallback "unknown"
@@ -714,11 +1008,11 @@ function Print-Summary {
     $dev = $Report.device_info
 
     Write-Header "FLASH_NETWORK — Device Enumeration Summary"
-    Write-Host "  Target      : $($meta.target):$($meta.port)"
-    Write-Host "  User        : $($meta.user)"
-    Write-Host "  OS          : $($meta.os_detected)"
-    Write-Host "  Hostname    : $($dev.hostname)"
-    Write-Host "  Architecture: $($dev.architecture)"
+    Write-Host "  Target      : $(Clear-UnsafeText -Value $meta.target -MaxLength 128):$($meta.port)"
+    Write-Host "  User        : $(Clear-UnsafeText -Value $meta.user -MaxLength 64)"
+    Write-Host "  OS          : $(Clear-UnsafeText -Value $meta.os_detected -MaxLength 64)"
+    Write-Host "  Hostname    : $(Clear-UnsafeText -Value $dev.hostname -MaxLength 128)"
+    Write-Host "  Architecture: $(Clear-UnsafeText -Value $dev.architecture -MaxLength 64)"
     Write-Host "  Duration    : $($meta.duration_seconds)s"
     Write-Section ""
 
@@ -728,10 +1022,10 @@ function Print-Summary {
     $count = 0
     foreach ($app in $Report.applications) {
         if ($count -ge 20) { break }
-        Write-Host "  [$($count + 1)] $($app.name)" -ForegroundColor White
-        if ($app.version) { Write-Host "      Version : $($app.version)" }
-        if ($app.signer)  { Write-Host "      Signer  : $($app.signer)" }
-        if ($app.install_location) { Write-Host "      Location: $($app.install_location)" }
+        Write-Host "  [$($count + 1)] $(Clear-UnsafeText -Value $app.name -MaxLength 256)" -ForegroundColor White
+        if ($app.version) { Write-Host "      Version : $(Clear-UnsafeText -Value $app.version -MaxLength 128)" }
+        if ($app.signer)  { Write-Host "      Signer  : $(Clear-UnsafeText -Value $app.signer -MaxLength 256)" }
+        if ($app.install_location) { Write-Host "      Location: $(Clear-UnsafeText -Value $app.install_location -MaxLength 512)" }
         Write-Host ""
         $count++
     }
@@ -744,8 +1038,8 @@ function Print-Summary {
         $errCount = 0
         foreach ($err in $meta.errors) {
             if ($errCount -ge 5) { break }
-            $errMsg = if ($err.error.Length -gt 100) { $err.error.Substring(0, 100) } else { $err.error }
-            Write-Host "    - $($err.command): $errMsg" -ForegroundColor Red
+            $errMsg = Clear-UnsafeText -Value $err.error -MaxLength 100
+            Write-Host "    - $(Clear-UnsafeText -Value $err.command -MaxLength 64): $errMsg" -ForegroundColor Red
             $errCount++
         }
     }
@@ -763,6 +1057,16 @@ if ($args.Count -gt 0) {
 
 if (-not $Target) {
     Write-Host "[ERROR] Target is required. Use -Target <host> or -Help for usage." -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-ValidTarget -Value $Target)) {
+    Write-Host "[ERROR] -Target must not start with '-', exceed 253 characters, or contain whitespace/control characters." -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-ValidTarget -Value $User)) {
+    Write-Host "[ERROR] -User must not be empty, start with '-', or contain whitespace/control characters." -ForegroundColor Red
     exit 1
 }
 
@@ -803,6 +1107,8 @@ $plainPassword = $null
 try {
     if ($PasswordFile) {
         if (-not (Test-Path -LiteralPath $PasswordFile)) { throw "Password file not found: $PasswordFile" }
+        $pwItem = Get-Item -LiteralPath $PasswordFile -ErrorAction Stop
+        if ($pwItem.Length -gt 65536) { throw "Password file is too large (max 64 KiB)." }
         $plainPassword = Get-Content -LiteralPath $PasswordFile -TotalCount 1
     } elseif ($AskPassword) {
         $secure = Read-Host -AsSecureString "SSH password"
@@ -816,11 +1122,11 @@ try {
     }
 
     if ($Command) {
-        if (-not $Quiet) { Write-Host "`n[ENUM] Running custom command on $Target..." -ForegroundColor Magenta }
+        if (-not $Quiet) { Write-Host "`n[ENUM] Running custom command on $(Clear-UnsafeText -Value $Target -MaxLength 128)..." -ForegroundColor Magenta }
         $result = Invoke-PlinkCommand -Target $Target -Port $Port -User $User `
             -Cmd $Command -AuthArgs $authArgs -Timeout $Timeout -Verbose $Verbose
-        Write-Host $result.stdout
-        if ($result.stderr) { Write-Host "[STDERR] $($result.stderr)" -ForegroundColor Red }
+        Write-Host (Clear-UnsafeBlock -Value $result.stdout)
+        if ($result.stderr) { Write-Host "[STDERR] $(Clear-UnsafeBlock -Value $result.stderr)" -ForegroundColor Red }
         exit $result.exitcode
     }
 

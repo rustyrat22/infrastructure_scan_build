@@ -2,10 +2,11 @@
 
 **Scope:** all files in this repository (`device_scanner`, `device_enumerator`,
 `network_scanner`, `network_diagram`, in both Python and PowerShell).
-**Date:** 2026-11-10
-**Status:** audit findings 1–4, 9, 11, 13–16, 20 and 21 are fixed, and the
-four "What I'd tackle next" items are complete. A small set of lower-priority
-follow-ups remains (section 2).
+**Date:** 2026-11-11
+**Status:** audit findings 1–4, 9, 11, 13–16, 20 and 21 are fixed; the
+"tackle next" items from the first two waves are complete; and the remaining
+process, permission, sanitisation, parser, and scope gaps have been closed.
+Section 3 records the few operational notes that remain.
 
 This document is an operator-facing summary. It intentionally avoids
 publishing working exploit payloads.
@@ -145,20 +146,53 @@ Additional hardening delivered alongside those items:
 
 ---
 
-## 3. Follow-up work (not fixed here)
+## 3. Third wave (fixed in this change)
 
-These lower-priority issues remain outside the current change.
+The four documented follow-ups and the residual process/permission/parser
+findings are now resolved.
 
-| Severity | Finding |
-|----------|---------|
-| Medium | Some application parsers still assume `|`-separated output. Debian/RPM and winget paths are handled, but `snap list`, `pacman -Qi`, and chocolatey output are not normalized, so those inventories can be empty or partial. |
-| Low | `device_enumerator.ps1` still declares `#Requires -RunAsAdministrator`, although it only invokes plink. |
-| Low | `scan_index.json` is still overwritten on every run, so scan history is lost. |
-| Low | Auto-range picks the first usable IPv4 adapter and may select a VPN or virtual adapter when several are active. Pass an explicit range for deterministic results. |
+| # | Finding | Fix |
+|---|---------|-----|
+| 22 | `snap list`, `pacman -Qi`, and chocolatey inventories were parsed as pipe-separated data and came out empty or partial | Dedicated `snap`, `pacman`, and `choco` parsers in both Python tools and both PowerShell tools. Snap whitespace columns, pacman key/value blocks, and `name|version` choco output are normalised, sanitised, and deduplicated. |
+| 23 | `device_enumerator.ps1` demanded administrator rights although it only invokes plink | The `#Requires -RunAsAdministrator` directive was removed. Packet-capture scripts still require elevation, as capture itself does. |
+| 24 | `scan_index.json` was overwritten on every scan, losing history | The previous index is renamed to a timestamped `scan_index_<UTC>.json` archive before the new index is written; archives are owner-only. |
+| 25 | Auto-range could select a VPN/virtual adapter | Physical adapters that carry the default route are preferred; VPN, tunnel, container, hypervisor, APIPA, and loopback adapters are deprioritised. This applies to the `ipconfig`/`ip addr` parser (Python) and `Get-NetIPAddress`/`Get-NetRoute` (PowerShell). |
+| 26 | tshark capture had no hard timeout and could grow memory without bound | Captures run through the bounded runner with `duration + 60 s` deadline, a 48 MiB stdout cap, and process-tree termination; packet analysis is separately capped. |
+| 27 | Child processes could outlive a timed-out command | `run_bounded()` and `Invoke-ProcessWithTimeout` start the child in its own group/session and terminate the whole tree (`taskkill /F /T` on Windows, `killpg` on POSIX). |
+| 28 | Tool output was read without a size limit (`cmp`, `Get-Content -Raw`) | Python drains stdout/stderr through capped buffers; PowerShell polls output files against `MaxOutputBytes` and reads them through `Read-BoundedTextFile`. |
+| 29 | Tool lookup trusted the current directory (PATH hijack) | `resolve_tool()` and `Resolve-TrustedTool` only accept absolute PATH directories, reject candidates under the working directory, and fall back to `System32` only for Windows built-ins. |
+| 30 | `plink`/`tshark` targets could start with `-` and inject options | Targets and usernames are validated (no leading `-`, no whitespace/control characters, length-capped) in Python and PowerShell. |
+| 31 | ACL/permission helpers swallowed failures | Permission helpers now throw on failure. Existing output directories are re-tightened on every run, closing the "created earlier with broad rights" gap. |
+| 32 | `Join-SafeOutputPath` did not resolve reparse points | Writes now walk the path and reject any junction/symlink component inside the output directory. |
+| 33 | Remote text could inject terminal escape sequences | Shared Python sanitiser (`sanitize_console_text` / `sanitize_console_block`) and PowerShell `Clear-UnsafeText` / `Clear-UnsafeBlock` strip ANSI/OSC escapes, C0/C1 controls, and bidi overrides before any value is stored or printed. |
+| 34 | Password temp files and reads were unbounded | Password files use private temp files with owner-only ACLs, are overwritten and removed, and reads are capped at 64 KiB / 4096 characters. |
+
+Additional hardening delivered in this wave:
+
+- **OUI fallback corrected.** The previous prefix comparison could never match
+  because it compared an 8-character prefix with 6-character constants. Router
+  and IoT OUI inference now works.
+- **Diagram output is private.** The untracked `network_diagram.py` /
+  `network_diagram.ps1` working-tree files now apply the same owner-only output
+  handling. They remain uncommitted because they contain unrelated user work.
 
 ---
 
-## 4. Operator guidance
+## 4. Operational notes
+
+These are not vulnerabilities in the current code, but remain operator
+considerations.
+
+| Severity | Note |
+|----------|------|
+| Info | `network_diagram.py` and `network_diagram.ps1` are still uncommitted user work. The output-permission edits are present in the working tree but must be committed by their owner. |
+| Info | Password files are a better transport than argv, but a hostile local administrator can still read the temp file while it exists. Prefer key-based authentication. |
+| Info | Auto-range now prefers the physical default-route adapter, but multi-homed hosts can still be ambiguous. Pass an explicit range for deterministic scans. |
+| Info | `-InsecureHostKey` / `--insecure-host-key` still permits MITM by design. Use it only on an isolated, trusted network. |
+
+---
+
+## 5. Operator guidance
 
 1. **Prefer keys over passwords.** Use `-k`/`-Key` with a passphrase-protected
    key where possible.
@@ -171,12 +205,13 @@ These lower-priority issues remain outside the current change.
    create output files owner-only, but keep the output directory out of version
    control and review its ACL on shared systems.
 5. **Scope scans tightly.** Pass an explicit `-Range`/`--range`. Auto-detection
-   now fails loudly instead of guessing, but it still selects the first usable
-   adapter and may pick a VPN interface.
+   now fails loudly instead of guessing and prefers the physical adapter that
+   carries the default route, but an explicit range is still the most
+   deterministic choice.
 
 ---
 
-## 5. Verification performed
+## 6. Verification performed
 
 - `python -m py_compile network_scanner.py device_scanner.py device_enumerator.py network_diagram.py`
 - Direct unit checks of the sanitiser, output-path guard, password-file
@@ -202,3 +237,41 @@ These lower-priority issues remain outside the current change.
   durations, and unknown arguments exit non-zero with a clear message.
 - `Calculate-Throughput` handles a single timeline sample without dividing by
   zero and reports true totals when the timeline is sampled.
+
+### Third-wave verification (2026-11-11)
+
+- `python -m py_compile flashnet_common.py network_scanner.py
+  device_scanner.py device_enumerator.py network_diagram.py` passes.
+- All four `.ps1` files parse with
+  `[System.Management.Automation.Language.Parser]::ParseFile` under Windows
+  PowerShell 5.1 and still carry a UTF-8 BOM.
+- Bounded runner probes: normal completion, timeout detection (2 s deadline
+  returns in under 15 s), grandchild termination, stdout truncation at the
+  configured cap without blocking the child, and no spurious timeout while
+  truncating.
+- Trusted-tool probe: an executable placed in the working directory and first
+  on `PATH` is not resolved.
+- Sanitiser probes: ANSI CSI/OSC, NUL, C0 controls, and bidi overrides are
+  removed; text is length-capped; block output preserves newlines.
+- Parser probes with sample output: `snap list`, `pacman -Qi`, `choco list`,
+  Debian/RPM pipe output, Windows registry blocks, and winget rows all produce
+  the expected records in Python and PowerShell.
+- Auto-range probe: a virtual adapter with a gateway is not selected over a
+  physical adapter with a gateway.
+- PowerShell containment probes: `..\escape.json` is rejected, a junction
+  inside the output directory is rejected, and a normal sibling path is
+  allowed.
+- Permission probes: a newly written file is reduced to a single owner-only
+  allow ACE, and existing output directories are re-tightened.
+- `Read-BoundedTextFile` returns exactly the configured number of bytes for an
+  oversized file.
+- CLI smoke tests: `--help`/`-Help`, unknown options, invalid modes, invalid
+  durations, non-numeric timeouts, and leading-`-` targets/usernames all exit
+  non-zero with a clear message.
+- `network_scanner.py` analysis probes: single-packet throughput is finite,
+  phantom devices are not created from empty MACs, Android User-Agent wins over
+  Linux, malformed numeric fields survive, malformed timestamps are excluded
+  from the timeline, hostile hostnames are sanitised, and OUI fallback
+  classification works.
+- CIDR membership probes cover `/24`, `/25`, `/31`, and `/32`; a `/32` target
+  is retained while its neighbour is rejected.

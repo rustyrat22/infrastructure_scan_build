@@ -38,6 +38,133 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+$script:TsharkPath = $null
+$script:MaxToolOutputBytes = 8 * 1024 * 1024
+$script:MaxCaptureOutputBytes = 48 * 1024 * 1024
+$script:MaxCapturePackets = 200000
+
+function Resolve-TrustedTool {
+    # Resolve a native tool to an absolute path, ignoring relative PATH entries
+    # and anything inside the current directory. This blocks PATH hijacking by
+    # a plink.exe/tshark.exe dropped into the scan directory.
+    param([string]$Name, [string[]]$FallbackDirs = @())
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+
+    $cwdFull = [System.IO.Path]::GetFullPath((Get-Location).Path)
+    $cwd = $cwdFull.TrimEnd([char[]]@('\', '/'))
+    # Running from a drive/share root must not make every absolute path look
+    # "inside the working directory", which would reject all tools on it.
+    $cwdIsRoot = ($cwd -eq [System.IO.Path]::GetPathRoot($cwdFull).TrimEnd([char[]]@('\', '/')))
+    $extensions = @("")
+    if ($env:OS -eq "Windows_NT" -and -not [System.IO.Path]::HasExtension($Name)) {
+        $extensions = @(".exe", ".cmd", ".bat", "")
+    }
+
+    $directories = @()
+    foreach ($entry in ($env:PATH -split [System.IO.Path]::PathSeparator)) {
+        $candidateDir = $entry.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($candidateDir)) { continue }
+        if (-not [System.IO.Path]::IsPathRooted($candidateDir)) { continue }
+        $directories += $candidateDir
+    }
+    if ($env:OS -eq "Windows_NT" -and $env:SystemRoot) {
+        $directories += [System.IO.Path]::Combine($env:SystemRoot, "System32")
+    }
+    $directories += $FallbackDirs
+
+    foreach ($directory in $directories) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        foreach ($extension in $extensions) {
+            $candidate = [System.IO.Path]::Combine($directory, $Name + $extension)
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $full = [System.IO.Path]::GetFullPath($candidate)
+            if (-not $cwdIsRoot -and ($full -eq $cwd -or $full.StartsWith($cwd + [System.IO.Path]::DirectorySeparatorChar,
+                    [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+            return $full
+        }
+    }
+    return $null
+}
+
+function Clear-UnsafeText {
+    # Remove ANSI escapes, control characters, and bidi overrides from text that
+    # originated on the network or in remote command output.
+    param([string]$Value, [int]$MaxLength = 200)
+    if ($null -eq $Value) { return "" }
+    $text = [regex]::Replace([string]$Value, "\x1B\[[0-?]*[ -/]*[@-~]", "")
+    $text = [regex]::Replace($text, "\x1B\][^\x07]*(?:\x07|\x1B\\)", "")
+    $text = [regex]::Replace($text, "\x1B[@-_]", "")
+    $text = [regex]::Replace($text, "[\u202A-\u202E\u2066-\u2069]", "")
+    $text = [regex]::Replace($text, "[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "")
+    $text = $text -replace "`r|`n", " "
+    if ($MaxLength -gt 0 -and $text.Length -gt $MaxLength) {
+        $text = $text.Substring(0, $MaxLength)
+    }
+    return $text
+}
+
+function Stop-ProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    if ($null -eq $Process) { return }
+    try {
+        if ($Process.HasExited) { return }
+        if ($env:OS -eq "Windows_NT") {
+            $taskkill = $null
+            if ($env:SystemRoot) {
+                $candidate = [System.IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $taskkill = $candidate }
+            }
+            if ($taskkill) {
+                & $taskkill /F /T /PID $Process.Id 2>$null | Out-Null
+            } else {
+                & taskkill /F /T /PID $Process.Id 2>$null | Out-Null
+            }
+        } else {
+            & kill -KILL $Process.Id 2>$null
+        }
+    } catch { }
+    try {
+        if (-not $Process.HasExited) { $Process.Kill() }
+    } catch { }
+}
+
+function New-SecureTempFile {
+    param([string]$Extension = ".tmp")
+    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+        "flashnet_" + [guid]::NewGuid().ToString("N") + $Extension)
+    $stream = [System.IO.File]::Create($path)
+    $stream.Close()
+    Set-RestrictiveFileAcl -Path $path
+    return $path
+}
+
+function Read-BoundedTextFile {
+    # Read at most MaxBytes from a file. Never let a remote command decide how
+    # much memory the scanner allocates.
+    param([string]$Path, [int]$MaxBytes = 8388608)
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $length = [int][Math]::Min($stream.Length, [long]$MaxBytes)
+            if ($length -le 0) { return "" }
+            $buffer = New-Object byte[] $length
+            $read = 0
+            while ($read -lt $length) {
+                $count = $stream.Read($buffer, $read, $length - $read)
+                if ($count -le 0) { break }
+                $read += $count
+            }
+            return [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
+
 function Write-Header {
     param([string]$Text)
     Write-Host ""
@@ -95,7 +222,8 @@ function Invoke-ProcessWithTimeout {
         [string[]]$Arguments,
         [int]$TimeoutSeconds,
         [string]$StdOutPath = "",
-        [string]$StdErrPath = ""
+        [string]$StdErrPath = "",
+        [int]$MaxOutputBytes = 8388608
     )
 
     $startParams = @{
@@ -109,100 +237,123 @@ function Invoke-ProcessWithTimeout {
 
     $process = Start-Process @startParams
     $timedOut = $false
+    $overflow = $false
 
     try {
-        if ($TimeoutSeconds -le 0) {
-            $process.WaitForExit()
-        } elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            $timedOut = $true
-            try { $process.Kill() } catch { }
+        $deadline = $null
+        if ($TimeoutSeconds -gt 0) { $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
+
+        while (-not $process.HasExited) {
+            if ($MaxOutputBytes -gt 0) {
+                $total = 0
+                foreach ($path in @($StdOutPath, $StdErrPath)) {
+                    if ($path -and (Test-Path -LiteralPath $path)) {
+                        try { $total += (Get-Item -LiteralPath $path -ErrorAction Stop).Length } catch { }
+                    }
+                }
+                if ($total -gt $MaxOutputBytes) {
+                    $overflow = $true
+                    Stop-ProcessTree -Process $process
+                    break
+                }
+            }
+            if ($null -ne $deadline -and [DateTime]::UtcNow -ge $deadline) {
+                $timedOut = $true
+                Stop-ProcessTree -Process $process
+                break
+            }
+            try {
+                if ($process.WaitForExit(200)) { break }
+            } catch {
+                break
+            }
+        }
+
+        if (-not $process.HasExited) {
+            Stop-ProcessTree -Process $process
             try { [void]$process.WaitForExit(2000) } catch { }
         }
     } catch {
-        try { $process.Kill() } catch { }
+        Stop-ProcessTree -Process $process
         throw
     }
 
-    $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
-    return @{ Process = $process; TimedOut = $timedOut; ExitCode = $exitCode }
+    $exitCode = if ($timedOut -or $overflow) { -1 } else { $process.ExitCode }
+    return @{ Process = $process; TimedOut = $timedOut; Truncated = $overflow; ExitCode = $exitCode }
 }
 
 function Set-RestrictiveFileAcl {
     param([string]$Path)
-    try {
-        if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $Path
-            $acl.SetAccessRuleProtection($true, $false)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-                "FullControl", "Allow")
-            $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $Path -AclObject $acl
-        } else {
-            & chmod 600 $Path 2>$null
-        }
-    } catch { }
+    if ($env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } else {
+        & chmod 600 $Path
+        if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for $Path" }
+    }
 }
 
 function Set-RestrictiveDirectoryAcl {
     param([string]$Path)
-    try {
-        if ($env:OS -eq "Windows_NT") {
-            $acl = Get-Acl -LiteralPath $Path
-            $acl.SetAccessRuleProtection($true, $false)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-                "FullControl", "Allow")
-            $acl.AddAccessRule($rule)
-            Set-Acl -LiteralPath $Path -AclObject $acl
-        } else {
-            & chmod 700 $Path 2>$null
-        }
-    } catch { }
+    if ($env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } else {
+        & chmod 700 $Path
+        if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for $Path" }
+    }
 }
 
 function New-TemporaryCaptureFile {
-    $path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
-        "flashnet_capture_" + [guid]::NewGuid().ToString("N") + ".pcapng")
-    $stream = [System.IO.File]::Create($path)
-    $stream.Close()
-    Set-RestrictiveFileAcl -Path $path
-    return $path
+    return New-SecureTempFile -Extension ".pcapng"
 }
 
 function Test-Tshark {
+    if (-not $script:TsharkPath) {
+        Write-Host "[ERROR] tshark not found in a trusted absolute PATH directory." -ForegroundColor Red
+        return $false
+    }
     try {
-        $result = & tshark --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $versionLine = $result[0]
+        $result = & $script:TsharkPath --version 2>&1
+        if ($LASTEXITCODE -eq 0 -and $result) {
+            $versionLine = Clear-UnsafeText -Value ([string]$result[0]) -MaxLength 200
             Write-Host "[OK] tshark found: $versionLine" -ForegroundColor Green
             return $true
         }
-    } catch {
-        # tshark prints version to stderr
-    }
+    } catch { }
 
     try {
-        $result = & tshark --version 2>&1 | Select-Object -First 1
+        $result = & $script:TsharkPath --version 2>&1 | Select-Object -First 1
         if ($result -match "TShark") {
-            Write-Host "[OK] tshark found: $result" -ForegroundColor Green
+            Write-Host "[OK] tshark found: $(Clear-UnsafeText -Value ([string]$result) -MaxLength 200)" -ForegroundColor Green
             return $true
         }
     } catch {}
 
-    Write-Host "[ERROR] tshark not found. Install Wireshark and add to PATH." -ForegroundColor Red
+    Write-Host "[ERROR] tshark could not be executed." -ForegroundColor Red
     return $false
 }
 
 function Get-Interfaces {
-    $result = & tshark -D 2>$null
+    if (-not $script:TsharkPath) { return @() }
+    $result = & $script:TsharkPath -D 2>$null
     $interfaces = @()
     foreach ($line in $result) {
         if ($line -match "^(\d+)\.\s+([^\s]+)\s+(.*)") {
             $interfaces += [PSCustomObject]@{
                 Index       = [int]$Matches[1]
-                Name        = $Matches[2]
-                Description = $Matches[3]
+                Name        = Clear-UnsafeText -Value $Matches[2] -MaxLength 128
+                Description = Clear-UnsafeText -Value $Matches[3] -MaxLength 256
             }
         }
     }
@@ -251,27 +402,36 @@ function Capture-Traffic {
     Write-Host "[CAPTURE] Capturing ${Duration}s on interface $($Interface.Name) ($($Interface.Description))..." -ForegroundColor Magenta
     Write-Host "          Temporary capture: $pcapFile"
 
-    $tmpOut = [System.IO.Path]::GetTempFileName()
+    $tmpOut = New-SecureTempFile -Extension ".tshark"
     $packets = New-Object System.Collections.Generic.List[object]
     try {
-        $run = Invoke-ProcessWithTimeout -FilePath "tshark" -Arguments $cmdArgs `
-            -TimeoutSeconds ($Duration + 60) -StdOutPath $tmpOut
+        if (-not $script:TsharkPath) {
+            Write-Host "[ERROR] tshark is not available." -ForegroundColor Red
+            return $pcapFile, $packets.ToArray()
+        }
+        $run = Invoke-ProcessWithTimeout -FilePath $script:TsharkPath -Arguments $cmdArgs `
+            -TimeoutSeconds ($Duration + 60) -StdOutPath $tmpOut `
+            -MaxOutputBytes $script:MaxCaptureOutputBytes
         if ($run.TimedOut) {
-            Write-Host "[WARN] tshark capture timed out after $($Duration + 60)s" -ForegroundColor Yellow
+            Write-Host "[WARN] tshark capture timed out after $($Duration + 60)s; analyzing partial output." -ForegroundColor Yellow
+        }
+        if ($run.Truncated) {
+            Write-Host "[WARN] tshark output exceeded the capture cap; analysis may be incomplete." -ForegroundColor Yellow
         }
 
-        if (Test-Path -LiteralPath $tmpOut) {
-            $lines = Get-Content -LiteralPath $tmpOut -Encoding UTF8
-            foreach ($line in $lines) {
+        $text = Read-BoundedTextFile -Path $tmpOut -MaxBytes $script:MaxCaptureOutputBytes
+        if ($text) {
+            foreach ($line in ($text -split "`n")) {
                 if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                if ($packets.Count -ge 200000) {
-                    Write-Host "[WARN] Capture exceeded 200000 packets; analysis truncated." -ForegroundColor Yellow
+                if ($packets.Count -ge $script:MaxCapturePackets) {
+                    Write-Host "[WARN] Capture exceeded $($script:MaxCapturePackets) packets; analysis truncated." -ForegroundColor Yellow
                     break
                 }
                 $parts = $line -split '\|'
                 $pkt = [ordered]@{}
                 for ($i = 0; $i -lt $fields.Count; $i++) {
-                    $pkt[$fields[$i]] = if ($i -lt $parts.Count) { $parts[$i].Trim() } else { "" }
+                    $value = if ($i -lt $parts.Count) { $parts[$i].Trim() } else { "" }
+                    $pkt[$fields[$i]] = Clear-UnsafeText -Value $value -MaxLength 256
                 }
                 $packets.Add($pkt)
             }
@@ -497,8 +657,8 @@ function Generate-Report {
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     if (!(Test-Path -LiteralPath $OutputDir)) {
         New-Item -ItemType Directory -Path $OutputDir | Out-Null
-        Set-RestrictiveDirectoryAcl -Path $OutputDir
     }
+    Set-RestrictiveDirectoryAcl -Path $OutputDir
 
     $jsonPath = Join-Path $OutputDir "network_scan_$timestamp.json"
     $report | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonPath -Encoding UTF8
@@ -514,9 +674,9 @@ function Print-Summary {
     $tp = $Report.throughput
 
     Write-Header "FLASH_NETWORK — Wireshark Scan Summary"
-    Write-Host "  Interface   : $($meta.interface_description)"
+    Write-Host "  Interface   : $(Clear-UnsafeText -Value $meta.interface_description -MaxLength 256)"
     Write-Host "  Duration    : $($meta.capture_duration_sec)s"
-    Write-Host "  Timestamp   : $($meta.timestamp)"
+    Write-Host "  Timestamp   : $(Clear-UnsafeText -Value $meta.timestamp -MaxLength 64)"
     Write-Section ""
 
     Write-Host "  THROUGHPUT:" -ForegroundColor Green
@@ -529,7 +689,7 @@ function Print-Summary {
     $sortedProtos = $Report.protocol_distribution.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 15
     foreach ($entry in $sortedProtos) {
         $bar = "#" * [Math]::Min($entry.Value, 50)
-        Write-Host ("    {0,-20} {1,6}  {2}" -f $entry.Name, $entry.Value, $bar)
+        Write-Host ("    {0,-20} {1,6}  {2}" -f (Clear-UnsafeText -Value $entry.Name -MaxLength 64), $entry.Value, $bar)
     }
 
     Write-Host ""
@@ -538,17 +698,19 @@ function Print-Summary {
 
     $idx = 1
     foreach ($dev in $Report.devices) {
-        Write-Host "  [$idx] $($dev.hostname)" -ForegroundColor White
-        Write-Host "      MAC     : $($dev.mac_address)"
-        Write-Host "      IPs     : $($dev.ip_addresses -join ', ')"
-        Write-Host "      Type    : $($dev.device_type)"
+        Write-Host "  [$idx] $(Clear-UnsafeText -Value $dev.hostname -MaxLength 128)" -ForegroundColor White
+        Write-Host "      MAC     : $(Clear-UnsafeText -Value $dev.mac_address -MaxLength 64)"
+        $ipText = @($dev.ip_addresses | ForEach-Object { Clear-UnsafeText -Value $_ -MaxLength 64 }) -join ', '
+        Write-Host "      IPs     : $ipText"
+        Write-Host "      Type    : $(Clear-UnsafeText -Value $dev.device_type -MaxLength 64)"
         Write-Host "      Traffic : $($dev.traffic.total_bytes) bytes ($($dev.traffic.packets_sent)↑ / $($dev.traffic.packets_received)↓)"
         if ($dev.protocols_observed.Count -gt 0) {
-            $protoStr = ($dev.protocols_observed | Select-Object -First 8) -join ", "
+            $protoStr = (@($dev.protocols_observed | Select-Object -First 8 |
+                ForEach-Object { Clear-UnsafeText -Value $_ -MaxLength 64 })) -join ", "
             Write-Host "      Protocols: $protoStr"
         }
         foreach ($h in ($dev.hints | Select-Object -First 3)) {
-            Write-Host "      Hint    : $h"
+            Write-Host "      Hint    : $(Clear-UnsafeText -Value $h -MaxLength 220)"
         }
         Write-Host ""
         $idx++
@@ -570,6 +732,7 @@ if ($Duration -lt 1 -or $Duration -gt 3600) {
     exit 1
 }
 
+$script:TsharkPath = Resolve-TrustedTool -Name "tshark"
 if (-not (Test-Tshark)) { exit 1 }
 
 $interfaces = @(Get-Interfaces)

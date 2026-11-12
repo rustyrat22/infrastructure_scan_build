@@ -8,14 +8,22 @@ Requirements:
   - SSH access to target devices (credentials or key-based auth)
 """
 
-import subprocess
 import sys
 import json
 import os
 import re
 import getpass
-import tempfile
 from datetime import datetime, timezone
+
+from flashnet_common import (
+    create_secure_temp_file,
+    resolve_tool,
+    run_bounded,
+    sanitize_console_block,
+    sanitize_console_text,
+    secure_file,
+    secure_output_dir,
+)
 
 
 # --- Security helpers -------------------------------------------------------
@@ -50,16 +58,53 @@ def safe_output_path(output_dir, filename):
     return candidate
 
 
+def clean_text(value, limit=200):
+    """Sanitise attacker-controlled text before storing or printing it."""
+    return sanitize_console_text(value, limit)
+
+
+def plink_path():
+    """Return the absolute path to a trusted plink, or raise FileNotFoundError."""
+    path = resolve_tool("plink")
+    if not path:
+        raise FileNotFoundError(
+            "plink was not found in a trusted absolute PATH directory"
+        )
+    return path
+
+
+def validate_target(value):
+    """Validate a user-supplied SSH target and reject option injection."""
+    text = str(value or "").strip()
+    if not text:
+        sys.exit("[ERROR] Target must not be empty.")
+    if text.startswith("-"):
+        sys.exit(f"[ERROR] Refusing target that looks like an option: {text!r}")
+    if len(text) > 253:
+        sys.exit("[ERROR] Target is too long (max 253 characters).")
+    if re.search(r"[\s\x00-\x1f\x7f]", text):
+        sys.exit("[ERROR] Target must not contain whitespace or control characters.")
+    return text
+
+
+def validate_user(value):
+    """Validate an SSH username before it is handed to plink."""
+    text = str(value or "").strip()
+    if not text:
+        sys.exit("[ERROR] SSH username must not be empty.")
+    if text.startswith("-"):
+        sys.exit(f"[ERROR] Refusing username that looks like an option: {text!r}")
+    if re.search(r"[\s\x00-\x1f\x7f]", text):
+        sys.exit("[ERROR] Username must not contain whitespace or control characters.")
+    return text
+
+
 def write_password_file(password):
     """Write *password* to a private temp file for `plink -pwfile`."""
-    fd, path = tempfile.mkstemp(prefix="flashnet_pw_", suffix=".txt")
+    fd, path = create_secure_temp_file(prefix="flashnet_pw_", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(password)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
         return path
     except Exception:
         try:
@@ -84,29 +129,10 @@ def remove_password_file(path):
 
 def read_password_file(path):
     """Read the first line of a password file without the trailing newline."""
+    if os.path.getsize(path) > 64 * 1024:
+        raise OSError("Password file is too large (max 64 KiB).")
     with open(path, "r", encoding="utf-8") as handle:
-        return handle.readline().rstrip("\r\n")
-
-
-def secure_output_dir(path):
-    """Create *path* and, on POSIX, restrict it to the owner."""
-    os.makedirs(path, exist_ok=True)
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
-    return path
-
-
-def secure_file(path):
-    """Restrict *path* to the owner on POSIX."""
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    return path
+        return handle.readline(4096).rstrip("\r\n")
 
 
 def parse_int_arg(value, option, minimum=None, maximum=None):
@@ -123,20 +149,19 @@ def parse_int_arg(value, option, minimum=None, maximum=None):
 
 
 def check_plink():
-    """Check if plink.exe is available on the system."""
+    """Check if plink.exe is available in a trusted location."""
+    path = resolve_tool("plink")
+    if not path:
+        print("[ERROR] plink not found in a trusted absolute PATH directory.")
+        return False
     try:
-        result = subprocess.run(
-            ["plink", "-V"],
-            capture_output=True, text=True, timeout=10
-        )
-        version = result.stderr.strip().split("\n")[0] if result.stderr else "Unknown"
+        result = run_bounded([path, "-V"], timeout=10,
+                             max_stdout=8192, max_stderr=8192)
+        version = clean_text(result.stderr.strip().split("\n")[0], 200) if result.stderr else "Unknown"
         print(f"[OK] plink found: {version}")
         return True
-    except FileNotFoundError:
-        print("[ERROR] plink not found. Install PuTTY and add to PATH.")
-        return False
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {clean_text(e, 200)}")
         return False
 
 
@@ -207,7 +232,10 @@ OUTPUT:
 
 def run_plink(target, port, user, cmd, auth_args=None, timeout=30, batch=True, verbose=False):
     """Execute a single command on a remote device via plink."""
-    base_cmd = ["plink"]
+    try:
+        base_cmd = [plink_path()]
+    except FileNotFoundError:
+        return "", "plink not found in a trusted location", -1
 
     if batch:
         base_cmd.extend(["-batch"])
@@ -219,24 +247,29 @@ def run_plink(target, port, user, cmd, auth_args=None, timeout=30, batch=True, v
         base_cmd.extend(auth_args)
 
     if verbose:
-        print(f"  [SSH] {user}@{target}:{port} > {cmd}")
+        print(f"  [SSH] {clean_text(user, 64)}@{clean_text(target, 128)}:{port} > {clean_text(cmd, 120)}")
 
     base_cmd.extend([target, cmd])
 
     try:
-        result = subprocess.run(
+        result = run_bounded(
             base_cmd,
-            capture_output=True, text=True, timeout=timeout
+            timeout=timeout,
+            max_stdout=4 * 1024 * 1024,
+            max_stderr=1024 * 1024,
         )
+        stderr = result.stderr
+        if result.timed_out:
+            stderr = (stderr + "\n" if stderr else "") + f"Command timed out after {timeout}s"
         if result.returncode != 0 and verbose:
             err = result.stderr.strip()
             if err:
-                print(f"  [WARN] plink exit {result.returncode}: {err[:200]}")
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        return "", f"Command timed out after {timeout}s", -1
+                print(f"  [WARN] plink exit {result.returncode}: {clean_text(err, 200)}")
+        return result.stdout, stderr, result.returncode
+    except FileNotFoundError:
+        return "", "plink not found in a trusted location", -1
     except Exception as e:
-        return "", str(e), -1
+        return "", clean_text(e, 200), -1
 
 
 def detect_os(target, port, user, auth_args, timeout, verbose):
@@ -296,6 +329,7 @@ def get_windows_commands():
         "listening_ports": "netstat -ano | findstr LISTENING",
         "installed_apps_registry": "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\" /s 2>nul | findstr /C:\"DisplayName\" /C:\"DisplayVersion\" /C:\"Publisher\" /C:\"InstallLocation\" /C:\"InstallDate\"",
         "installed_apps_wow64": "reg query \"HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\" /s 2>nul | findstr /C:\"DisplayName\" /C:\"DisplayVersion\" /C:\"Publisher\" /C:\"InstallLocation\" /C:\"InstallDate\"",
+        "installed_apps_choco": "choco list -l -r 2>nul",
         "winget_apps": "winget list --accept-source-agreements 2>nul",
         "open_ports": "netstat -ano | findstr LISTENING",
         "services": "sc query state= all | findstr /C:\"SERVICE_NAME\" /C:\"STATE\"",
@@ -320,24 +354,96 @@ def get_macos_commands():
     }
 
 
+def _app_record(name="", version="", signer="", install_location="", url="",
+                last_update=""):
+    """Build a sanitised application record."""
+    return {
+        "name": clean_text(name, 256),
+        "version": clean_text(version, 128),
+        "signer": clean_text(signer, 256),
+        "install_location": clean_text(install_location, 512),
+        "url": clean_text(url, 512),
+        "last_update": clean_text(last_update, 64),
+    }
+
+
 def parse_linux_packages(stdout):
-    """Parse Linux package list into structured dicts."""
+    """Parse dpkg/rpm pipe-delimited package output."""
     apps = []
     for line in stdout.strip().split("\n"):
         if "|" not in line:
             continue
         parts = line.split("|")
-        if len(parts) >= 2:
-            app = {
-                "name": parts[0].strip(),
-                "version": parts[1].strip() if len(parts) > 1 else "",
-                "signer": parts[2].strip() if len(parts) > 2 else "",
-                "install_location": "",
-                "url": "",
-                "last_update": "",
-            }
-            if app["name"]:
-                apps.append(app)
+        app = _app_record(
+            name=parts[0].strip(),
+            version=parts[1].strip() if len(parts) > 1 else "",
+            signer=parts[2].strip() if len(parts) > 2 else "",
+        )
+        if app["name"]:
+            apps.append(app)
+    return apps
+
+
+def parse_snap_packages(stdout):
+    """Parse `snap list` whitespace-column output."""
+    apps = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith(("name ", "error:", "no snaps")):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", name):
+            continue
+        publisher = parts[4].rstrip("*✓") if len(parts) > 4 else ""
+        apps.append(_app_record(name=name, version=parts[1], signer=publisher))
+    return apps
+
+
+def parse_pacman_packages(stdout):
+    """Parse `pacman -Qi` key/value blocks."""
+    apps = []
+    current = {}
+
+    def flush():
+        if current.get("Name"):
+            apps.append(_app_record(
+                name=current.get("Name", ""),
+                version=current.get("Version", ""),
+                signer=current.get("Packager", ""),
+                url=current.get("URL", ""),
+                last_update=current.get("Install Date", ""),
+            ))
+
+    for line in stdout.splitlines():
+        if not line.strip():
+            flush()
+            current = {}
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key in ("Name", "Version", "Packager", "Install Date", "URL"):
+            current[key] = value.strip()
+    flush()
+    return apps
+
+
+def parse_choco_packages(stdout):
+    """Parse `choco list -l -r` (`name|version`) output."""
+    apps = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        name, _, version = line.partition("|")
+        name, version = name.strip(), version.strip()
+        if not name or name.lower().startswith("chocolatey"):
+            continue
+        apps.append(_app_record(name=name, version=version))
     return apps
 
 
@@ -369,26 +475,19 @@ def parse_windows_registry(stdout):
         if field == "DisplayName":
             if current and current.get("name"):
                 apps.append(current)
-            current = {
-                "name": value,
-                "version": "",
-                "signer": "",
-                "install_location": "",
-                "url": "",
-                "last_update": "",
-            }
+            current = _app_record(name=value)
             continue
 
         if current is None:
             continue
         if field == "DisplayVersion":
-            current["version"] = value
+            current["version"] = clean_text(value, 128)
         elif field == "Publisher":
-            current["signer"] = value
+            current["signer"] = clean_text(value, 256)
         elif field == "InstallLocation":
-            current["install_location"] = value
+            current["install_location"] = clean_text(value, 512)
         elif field == "InstallDate":
-            current["last_update"] = value
+            current["last_update"] = clean_text(value, 64)
 
     if current and current.get("name"):
         apps.append(current)
@@ -402,15 +501,12 @@ def parse_winget(stdout):
     lines = stdout.strip().split("\n")
     for line in lines[3:]:
         parts = line.split()
-        if len(parts) >= 3:
-            apps.append({
-                "name": " ".join(parts[:-2]),
-                "version": parts[-2],
-                "signer": parts[-1] if len(parts) > 3 else "",
-                "install_location": "",
-                "url": "",
-                "last_update": "",
-            })
+        if len(parts) >= 3 and not line.strip().startswith("-"):
+            apps.append(_app_record(
+                name=" ".join(parts[:-2]),
+                version=parts[-2],
+                signer=parts[-1] if len(parts) > 3 else "",
+            ))
     return apps
 
 
@@ -419,15 +515,21 @@ def parse_applications(stdout_map, os_type):
     apps = []
 
     if os_type == "linux":
-        for key in ("installed_packages_deb", "installed_packages_rpm", "installed_packages_pacman"):
-            if key in stdout_map and stdout_map[key]:
+        for key in ("installed_packages_deb", "installed_packages_rpm"):
+            if stdout_map.get(key):
                 apps.extend(parse_linux_packages(stdout_map[key]))
+        if stdout_map.get("installed_packages_pacman"):
+            apps.extend(parse_pacman_packages(stdout_map["installed_packages_pacman"]))
+        if stdout_map.get("snap_packages"):
+            apps.extend(parse_snap_packages(stdout_map["snap_packages"]))
 
     elif os_type == "windows":
         for key in ("installed_apps_registry", "installed_apps_wow64"):
-            if key in stdout_map and stdout_map[key]:
+            if stdout_map.get(key):
                 apps.extend(parse_windows_registry(stdout_map[key]))
-        if "winget_apps" in stdout_map and stdout_map["winget_apps"]:
+        if stdout_map.get("installed_apps_choco"):
+            apps.extend(parse_choco_packages(stdout_map["installed_apps_choco"]))
+        if stdout_map.get("winget_apps"):
             apps.extend(parse_winget(stdout_map["winget_apps"]))
 
     elif os_type == "macos":
@@ -437,11 +539,11 @@ def parse_applications(stdout_map, os_type):
             if "Version:" in line:
                 match = re.search(r"Version:\s*(.+)", line)
                 if match:
-                    current["version"] = match.group(1).strip()
+                    current["version"] = clean_text(match.group(1).strip(), 128)
             if "Location:" in line:
                 match = re.search(r"Location:\s*(.+)", line)
                 if match:
-                    current["install_location"] = match.group(1).strip()
+                    current["install_location"] = clean_text(match.group(1).strip(), 512)
                     if current.get("name"):
                         current.setdefault("signer", "")
                         current.setdefault("url", "")
@@ -451,7 +553,16 @@ def parse_applications(stdout_map, os_type):
             elif line.strip() and not line.startswith(" "):
                 name = line.strip().rstrip(":")
                 if name and len(name) > 2:
-                    current = {"name": name}
+                    current = _app_record(name=name)
+
+        if stdout_map.get("brew_packages"):
+            for line in stdout_map["brew_packages"].strip().split("\n"):
+                parts = line.split()
+                if parts:
+                    apps.append(_app_record(
+                        name=parts[0],
+                        version=parts[1] if len(parts) > 1 else "",
+                    ))
 
     # Deduplicate by name
     seen = set()
@@ -474,7 +585,7 @@ def enumerate_device(target, port=22, user="root", auth_args=None, os_type=None,
         auth_args = []
 
     if not quiet:
-        print(f"\n[ENUM] Connecting to {target}:{port} as {user}...")
+        print(f"\n[ENUM] Connecting to {clean_text(target, 128)}:{port} as {clean_text(user, 64)}...")
 
     if os_type is None:
         os_type = detect_os(target, port, user, auth_args, timeout, verbose)
@@ -496,24 +607,25 @@ def enumerate_device(target, port=22, user="root", auth_args=None, os_type=None,
 
     for label, cmd in commands.items():
         if verbose and not quiet:
-            print(f"  [CMD] {label}: {cmd[:60]}...")
+            print(f"  [CMD] {clean_text(label, 64)}: {clean_text(cmd, 60)}...")
         stdout, stderr, rc = run_plink(target, port, user, cmd, auth_args, timeout, batch, verbose)
         stdout_map[label] = stdout
         if rc != 0 and stderr:
-            errors.append({"command": label, "error": stderr[:200]})
+            errors.append({"command": clean_text(label, 64),
+                           "error": clean_text(stderr, 200)})
 
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
 
     device_info = {
-        "hostname": stdout_map.get("hostname", "").strip(),
-        "os": stdout_map.get("os_release", stdout_map.get("os_info", "")).strip()[:200],
-        "architecture": stdout_map.get("architecture", "").strip(),
-        "kernel": stdout_map.get("kernel", "").strip(),
-        "uptime": stdout_map.get("uptime", "").strip()[:200],
-        "ip_config": stdout_map.get("ip_config", "").strip()[:500],
-        "default_gateway": stdout_map.get("default_gateway", "").strip(),
-        "dns_servers": stdout_map.get("dns_servers", "").strip(),
-        "listening_ports": stdout_map.get("listening_ports", "").strip()[:1000],
+        "hostname": clean_text(stdout_map.get("hostname", "").strip(), 128),
+        "os": clean_text(stdout_map.get("os_release", stdout_map.get("os_info", "")).strip(), 200),
+        "architecture": clean_text(stdout_map.get("architecture", "").strip(), 64),
+        "kernel": clean_text(stdout_map.get("kernel", "").strip(), 128),
+        "uptime": clean_text(stdout_map.get("uptime", "").strip(), 200),
+        "ip_config": clean_text(stdout_map.get("ip_config", "").strip(), 500),
+        "default_gateway": clean_text(stdout_map.get("default_gateway", "").strip(), 256),
+        "dns_servers": clean_text(stdout_map.get("dns_servers", "").strip(), 500),
+        "listening_ports": clean_text(stdout_map.get("listening_ports", "").strip(), 1000),
     }
 
     apps = parse_applications(stdout_map, os_type)
@@ -564,31 +676,31 @@ def print_summary(report, filepath):
     print("\n" + "=" * 60)
     print("  FLASH_NETWORK — Device Enumeration Summary")
     print("=" * 60)
-    print(f"  Target      : {meta['target']}:{meta['port']}")
-    print(f"  User        : {meta['user']}")
-    print(f"  OS          : {meta['os_detected']}")
-    print(f"  Hostname    : {dev['hostname']}")
-    print(f"  Architecture: {dev['architecture']}")
+    print(f"  Target      : {clean_text(meta['target'], 128)}:{meta['port']}")
+    print(f"  User        : {clean_text(meta['user'], 64)}")
+    print(f"  OS          : {clean_text(meta['os_detected'], 64)}")
+    print(f"  Hostname    : {clean_text(dev['hostname'], 128)}")
+    print(f"  Architecture: {clean_text(dev['architecture'], 64)}")
     print(f"  Duration    : {meta['duration_seconds']}s")
     print("-" * 60)
 
     print(f"\n  APPLICATIONS FOUND: {report['application_count']}")
     print("-" * 60)
     for i, app in enumerate(report["applications"][:20], 1):
-        print(f"  [{i}] {app['name']}")
+        print(f"  [{i}] {clean_text(app['name'], 256)}")
         if app.get("version"):
-            print(f"      Version : {app['version']}")
+            print(f"      Version : {clean_text(app['version'], 128)}")
         if app.get("signer"):
-            print(f"      Signer  : {app['signer']}")
+            print(f"      Signer  : {clean_text(app['signer'], 256)}")
         if app.get("install_location"):
-            print(f"      Location: {app['install_location']}")
+            print(f"      Location: {clean_text(app['install_location'], 512)}")
     if report["application_count"] > 20:
         print(f"  ... and {report['application_count'] - 20} more")
 
     if meta["errors"]:
         print(f"\n  ERRORS ({len(meta['errors'])}):")
         for err in meta["errors"][:5]:
-            print(f"    - {err['command']}: {err['error'][:100]}")
+            print(f"    - {clean_text(err['command'], 64)}: {clean_text(err['error'], 100)}")
 
     print("\n" + "=" * 60)
     print(f"  Full report saved to: {filepath}")
@@ -688,6 +800,9 @@ def main():
         print("[ERROR] Target is required. Use -t <host> or --help for usage.")
         sys.exit(1)
 
+    target = validate_target(target)
+    user = validate_user(user)
+
     if not quiet:
         print("=" * 60)
         print("  Flash_Network — PuTTY/Plink Device Enumerator")
@@ -740,11 +855,11 @@ def main():
     try:
         if custom_cmd:
             if not quiet:
-                print(f"\n[ENUM] Running custom command on {target}...")
+                print(f"\n[ENUM] Running custom command on {clean_text(target, 128)}...")
             stdout, stderr, rc = run_plink(target, port, user, custom_cmd, auth_args, timeout, batch, verbose)
-            print(stdout)
+            print(sanitize_console_block(stdout))
             if stderr:
-                print(f"[STDERR] {stderr}", file=sys.stderr)
+                print(f"[STDERR] {sanitize_console_block(stderr)}", file=sys.stderr)
             sys.exit(rc)
 
         report = enumerate_device(
